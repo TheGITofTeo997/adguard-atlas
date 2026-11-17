@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <a href="https://hub.docker.com/r/YOUR_DOCKERHUB_USER/adguard-atlas"><img alt="Docker pulls" src="https://img.shields.io/docker/pulls/YOUR_DOCKERHUB_USER/adguard-atlas"></a>
-  <a href="https://hub.docker.com/r/YOUR_DOCKERHUB_USER/adguard-atlas/tags"><img alt="Docker version" src="https://img.shields.io/docker/v/YOUR_DOCKERHUB_USER/adguard-atlas?sort=semver&label=image"></a>
+  <a href="https://hub.docker.com/r/theaccountofteo997/adguard-atlas"><img alt="Docker pulls" src="https://img.shields.io/docker/pulls/theaccountofteo997/adguard-atlas"></a>
+  <a href="https://hub.docker.com/r/theaccountofteo997/adguard-atlas/tags"><img alt="Docker version" src="https://img.shields.io/docker/v/theaccountofteo997/adguard-atlas?sort=semver&label=image"></a>
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
@@ -56,7 +56,7 @@ Create a `docker-compose.yml`:
 ```yaml
 services:
   adguard-atlas:
-    image: YOUR_DOCKERHUB_USER/adguard-atlas:latest
+    image: theaccountofteo997/adguard-atlas:latest
     container_name: adguard-atlas
     ports:
       - "8080:8080"
