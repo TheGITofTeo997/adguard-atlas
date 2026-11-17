@@ -1,69 +1,39 @@
 # syntax=docker/dockerfile:1
 
-# ============================================
-# Stage 1: Dependencies
-# ============================================
-FROM node:25-alpine AS dependencies
-
-# Set working directory
+# ---------- Stage 1: production dependencies ----------
+FROM node:24-alpine AS dependencies
 WORKDIR /app
-
-# Install dumb-init for proper signal handling and update packages for security
-RUN apk upgrade --no-cache && apk add --no-cache dumb-init
-
-# Copy package files
 COPY package*.json ./
-
-# Install production dependencies only
-RUN npm ci --only=production --ignore-scripts \
+RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund \
     && npm cache clean --force
+# Fail the build loudly (instead of shipping a blank map) if the MapLibre dist layout changes
+RUN test -f node_modules/maplibre-gl/dist/maplibre-gl.mjs && test -f node_modules/maplibre-gl/dist/maplibre-gl.css \
+    || (echo "maplibre-gl dist layout changed:" && ls node_modules/maplibre-gl/dist && exit 1)
 
-# ============================================
-# Stage 2: Production
-# ============================================
-FROM node:25-alpine AS production
+# ---------- Stage 2: runtime ----------
+FROM node:24-alpine AS production
+ENV NODE_ENV=production \
+    DATA_DIR=/data
 
-# Set NODE_ENV
-ENV NODE_ENV=production
-
-# Upgrade base-image packages to pick up security fixes (e.g. openssl >=3.5.7-r0,
-# CVE-2026-34182) — the dependencies stage's upgrade does not carry into this stage.
-# Also remove the bundled npm/npx CLI: it is not used at runtime (the app starts via
-# `node server/index.js`) and its vendored deps carry vulns (e.g. picomatch ReDoS,
-# CVE-2026-33671). Dropping it removes the finding and shrinks the attack surface.
+# Pick up base-image security fixes, add a proper init, drop npm/npx (not needed at runtime)
 RUN apk upgrade --no-cache \
-    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
+    && apk add --no-cache dumb-init \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+    && mkdir -p /data && chown node:node /data
 
-# Create non-root user and group
-RUN addgroup -g 1001 -S nodejs \
-    && adduser -S nodejs -u 1001
-
-# Set working directory
 WORKDIR /app
+COPY --from=dependencies --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node server ./server
+COPY --chown=node:node public ./public
+COPY --chown=node:node login ./login
+COPY --chown=node:node package.json ./
 
-# Copy dumb-init from dependencies stage
-COPY --from=dependencies /usr/bin/dumb-init /usr/bin/dumb-init
-
-# Copy node_modules from dependencies stage with correct ownership
-COPY --from=dependencies --chown=nodejs:nodejs /app/node_modules ./node_modules
-
-# Copy application files with correct ownership
-COPY --chown=nodejs:nodejs server ./server
-COPY --chown=nodejs:nodejs public ./public
-COPY --chown=nodejs:nodejs package.json ./
-
-# Switch to non-root user
-USER nodejs
-
-# Expose port (configurable via environment variable)
+USER node
+VOLUME /data
 EXPOSE 8080
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:8080', (res) => process.exit(res.statusCode === 200 ? 0 : 1))"
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-# Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
-
-# Start the application
 CMD ["node", "server/index.js"]

@@ -1,1653 +1,360 @@
-const CONFIG = {
-  MAX_CONCURRENT_ARCS: 100,
-  MAX_LOG_ENTRIES: 15,
-  MAX_CONCURRENT_LABELS: 12,
-  MAX_LABEL_QUEUE_SIZE: 50,
-  ARC_ANIMATION_DURATION: 1500,
-  LABEL_LIFETIME: 5000,
-  LABEL_LIFETIME_MIN: 3000,
-  LABEL_PADDING: 15,
-  LABEL_SEARCH_RADIUS: 200,
-  LABEL_ANGLE_STEPS: 16,
-  LABEL_QUEUE_ENABLED: true,
-  LABEL_PRIORITY_BLOCKED: true,
-  ARC_TRAIL_COUNT: 3,
-  ARC_TRAIL_LIFETIME: 2000,
-  RECONNECT_BASE_DELAY: 1000,
-  RECONNECT_MAX_DELAY: 30000,
-  RECONNECT_MAX_ATTEMPTS: 10,
-  SOURCE_PULSE_THROTTLE: 100,
-  DESTINATION_GLOW_DURATION: 1500,
-  LABEL_APPROX_WIDTH: 200,   // approximate rendered width of .arc-label in px
-  LABEL_APPROX_HEIGHT: 64,   // approximate rendered height of .arc-label in px
-  MAX_RESPONSE_SAMPLES: 200,
-  GLOW_CLEANUP_DELAY_MS: 100, // MapLibre needs one frame before layer removal after animation ends
+import * as maplibregl from '/vendor/maplibre-gl/maplibre-gl.mjs';
+import { PRESETS, BASEMAP_URLS, TYPE_COLORS, DEFAULTS, loadSettings, saveSettings, typeKey, ClientColors } from './config.js';
+import { initSettingsUI } from './settings-ui.js';
+
+const $ = (id) => document.getElementById(id);
+const EMPTY = { type: 'FeatureCollection', features: [] };
+const LOCAL = /\.(local|lan|home|arpa|internal|localdomain)\.?$/i;
+
+const settings = loadSettings();
+const colors = new ClientColors();
+const clients = new Map();          // ip -> { count, last }
+const arcs = [];
+const labels = new Set();
+const stats = { total: 0, blocked: 0, msSum: 0, msN: 0 };
+let serverSource = null;
+let lastStats = null;
+let activeTab = 'domains';
+let mapReady = false;
+let firstConfig = true;
+
+/* ---------------- theme ---------------- */
+function applyTheme() {
+  const p = PRESETS[settings.preset] ?? PRESETS.midnight;
+  const r = document.documentElement;
+  const vars = { '--bg': p.bg, '--panel': p.panel, '--fg': p.fg, '--muted': p.muted, '--line': p.line, '--accent': settings.accent || p.accent };
+  for (const [k, v] of Object.entries(vars)) r.style.setProperty(k, v);
+  r.style.setProperty('--panel-alpha', settings.panelOpacity);
+  r.style.setProperty('--blur', `${settings.blur}px`);
+  r.dataset.theme = p.light ? 'light' : 'dark';
+  r.dataset.side = settings.sidebar;
+  $('panel').hidden = settings.sidebarHidden;
+  $('show-panel').hidden = !settings.sidebarHidden;
+}
+
+const styleUrl = () => {
+  const key = settings.basemap === 'auto' ? (PRESETS[settings.preset]?.light ? 'light' : 'dark') : settings.basemap;
+  return BASEMAP_URLS[key] ?? BASEMAP_URLS.dark;
 };
 
-const DNS_TYPE_COLORS = Object.freeze({
-  'A': '#f6ad55',
-  'AAAA': '#4299e1',
-  'CNAME': '#48bb78',
-  'MX': '#9f7aea',
-  'TXT': '#ed8936',
-  'NS': '#38b2ac',
-  'SOA': '#fc8181',
-  'PTR': '#f687b3',
-  'SRV': '#ecc94b',
-  'CAA': '#667eea'
+/* ---------------- source location ---------------- */
+function getSource() {
+  const lat = Number.parseFloat(settings.srcLat);
+  const lng = Number.parseFloat(settings.srcLng);
+  if (Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
+  return serverSource ?? { lat: 20, lng: 0 };
+}
+
+/* ---------------- map ---------------- */
+let currentStyle = styleUrl();
+const map = new maplibregl.Map({ container: 'map', style: currentStyle, center: [10, 25], zoom: 1.6, attributionControl: { compact: true } });
+map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right');
+
+function fatal(msg) {
+  $('spinner').hidden = true;
+  $('loading-text').textContent = msg;
+  $('loading').hidden = false;
+}
+const hideLoading = () => { $('loading').hidden = true; };
+setTimeout(hideLoading, 8000); // never block the UI on slow basemap tiles
+
+map.on('load', hideLoading);
+map.on('idle', hideLoading);
+map.on('error', (e) => {
+  if (/webgl/i.test(String(e?.error?.message ?? ''))) fatal('WebGL2 is required to draw the map. Enable hardware acceleration or try another browser.');
 });
 
-const state = {
-  map: null,
-  ws: null,
-  isDarkMode: true,
-  isSidebarRight: false,
-  navigationControl: null,
-  activeArcs: [],
-  activeLabelBounds: [],
-  activeLabels: 0,
-  labelQueue: [],
-  totalQueries: 0,
-  blockedQueries: 0,
-  responseTimes: [],
-  upstreamTimes: [],
-  logEntries: [],
-  sourcePulseActive: false,
-  reconnectAttempts: 0,
-  reconnectTimeoutId: null,
-  statsUpdateIntervalId: null,
-  filterLocal: false,
-  sourceLocation: { lat: 3.139, lng: 101.6869, city: 'Kuala Lumpur' },
-  sourceMarker: null
-};
+function dstLayer(id, filter, paint) { map.addLayer({ id, type: 'circle', source: 'atlas', filter, paint }); }
 
-// Central animation registry — replaces per-animation setInterval timers
-const _animations = new Map(); // key → { startTime, duration, onFrame, onComplete }
-let _rafId = null;
-
-function prefersReducedMotion() {
-  return typeof window.matchMedia === 'function' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
-
-function _scheduleAnimation(key, duration, onFrame, onComplete) {
-  // Honor reduced-motion: jump straight to the final frame, skip the tween.
-  if (prefersReducedMotion()) {
-    try { onFrame(1); } catch (error) { console.error('Animation frame error:', error); }
-    if (onComplete) { try { onComplete(); } catch (e) { console.error('Animation complete error:', e); } }
-    return;
-  }
-
-  _animations.set(key, { startTime: null, duration, onFrame, onComplete: onComplete || null });
-  if (_rafId === null) {
-    _rafId = requestAnimationFrame(_animationLoop);
-  }
-}
-
-function _cancelAnimation(key) {
-  _animations.delete(key);
-}
-
-function _animationLoop(timestamp) {
-  for (const [key, anim] of _animations) {
-    if (anim.startTime === null) anim.startTime = timestamp;
-    const t = Math.min((timestamp - anim.startTime) / anim.duration, 1);
-
-    try {
-      anim.onFrame(t);
-    } catch (error) {
-      console.error('Animation frame error:', error);
-      _animations.delete(key);
-      continue;
-    }
-
-    if (t >= 1) {
-      _animations.delete(key);
-      if (anim.onComplete) {
-        try { anim.onComplete(); } catch (e) { console.error('Animation complete error:', e); }
-      }
-    }
-  }
-
-  if (_animations.size > 0) {
-    _rafId = requestAnimationFrame(_animationLoop);
-  } else {
-    _rafId = null;
-  }
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-  try {
-    initApp();
-  } catch (error) {
-    console.error('Failed to initialize application:', error);
-    showError('Application initialization failed. Please refresh the page.');
-  }
+map.on('style.load', () => {
+  map.addSource('atlas', { type: 'geojson', data: EMPTY });
+  const is = (k) => ['==', ['get', 'k'], k];
+  const line = { 'line-cap': 'round', 'line-join': 'round' };
+  map.addLayer({ id: 'arc-glow', type: 'line', source: 'atlas', filter: is('arc'), layout: line,
+    paint: { 'line-color': ['get', 'c'], 'line-width': 8, 'line-blur': 4, 'line-opacity': ['*', ['get', 'o'], 0.35] } });
+  map.addLayer({ id: 'arc-line', type: 'line', source: 'atlas', filter: is('arc'), layout: line,
+    paint: { 'line-color': ['get', 'c'], 'line-width': 2, 'line-opacity': ['get', 'o'] } });
+  dstLayer('dst', is('dst'), { 'circle-color': ['get', 'c'], 'circle-radius': ['get', 'r'], 'circle-opacity': ['get', 'o'], 'circle-blur': 0.3 });
+  dstLayer('src-halo', is('src'), { 'circle-color': '#5b8cff', 'circle-radius': 16, 'circle-opacity': 0.2 });
+  dstLayer('src', is('src'), { 'circle-color': '#ffffff', 'circle-radius': 5, 'circle-stroke-color': '#5b8cff', 'circle-stroke-width': 2 });
+  applyArcPaint();
+  applyProjection();
+  mapReady = true;
 });
 
-function initApp() {
-  loadPreferences();
-  initMap();
-  connectWebSocket();
-  setupEventListeners();
-  state.statsUpdateIntervalId = setInterval(updateStats, 1000);
+function applyProjection() {
+  try { map.setProjection({ type: settings.globe ? 'globe' : 'mercator' }); } catch { /* unsupported */ }
 }
 
-function setupEventListeners() {
-  const themeToggle = document.getElementById('theme-toggle');
-  const sidebarToggle = document.getElementById('sidebar-toggle');
-  const sidebarHideToggle = document.getElementById('sidebar-hide-toggle');
-  const sourceLocationToggle = document.getElementById('source-location-toggle');
-  const layoutToggle = document.getElementById('layout-toggle');
-
-  if (themeToggle) themeToggle.addEventListener('click', toggleTheme);
-  if (sidebarToggle) sidebarToggle.addEventListener('click', toggleSidebarPosition);
-  if (sidebarHideToggle) sidebarHideToggle.addEventListener('click', toggleSidebarVisibility);
-  if (sourceLocationToggle) sourceLocationToggle.addEventListener('click', openSourceLocationModal);
-  if (layoutToggle) layoutToggle.addEventListener('click', cycleLayout);
-
-  const filterLocalToggle = document.getElementById('filter-local-toggle');
-  if (filterLocalToggle) {
-    filterLocalToggle.addEventListener('change', (e) => {
-      state.filterLocal = e.target.checked;
-      savePreference('filterLocal', state.filterLocal);
-    });
-  }
-
-  setupModalEventListeners();
-
-  window.addEventListener('beforeunload', cleanup);
+function applyArcPaint() {
+  if (!map.getLayer('arc-line')) return;
+  const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#5b8cff';
+  map.setPaintProperty('arc-line', 'line-width', settings.arcWidth);
+  map.setPaintProperty('arc-glow', 'line-width', settings.arcWidth * 3 + settings.glow);
+  map.setPaintProperty('arc-glow', 'line-blur', settings.glow);
+  map.setLayoutProperty('arc-glow', 'visibility', settings.glow > 0 ? 'visible' : 'none');
+  map.setPaintProperty('src', 'circle-stroke-color', accent);
+  map.setPaintProperty('src-halo', 'circle-color', accent);
 }
 
-function loadPreferences() {
-  try {
-    const savedPosition = localStorage.getItem('sidebarPosition');
-    if (savedPosition === 'right') {
-      state.isSidebarRight = true;
-      document.body.classList.add('sidebar-right');
-    }
-
-    const savedSidebarHidden = localStorage.getItem('sidebarHidden');
-    if (savedSidebarHidden === 'true') {
-      document.body.classList.add('sidebar-hidden');
-    }
-
-    const savedFilterLocal = localStorage.getItem('filterLocal');
-    if (savedFilterLocal === 'true') {
-      state.filterLocal = true;
-      const toggle = document.getElementById('filter-local-toggle');
-      if (toggle) toggle.checked = true;
-    }
-
-    const savedLayout = localStorage.getItem('dashboardLayout');
-    if (savedLayout) {
-      applyLayout(savedLayout);
-    }
-
-    const savedSourceLocation = localStorage.getItem('sourceLocation');
-    if (savedSourceLocation) {
-      try {
-        state.sourceLocation = JSON.parse(savedSourceLocation);
-      } catch (e) {
-        console.warn('Failed to parse saved source location:', e);
-      }
-    }
-  } catch (error) {
-    console.warn('Failed to load preferences from localStorage:', error);
-  }
+function refreshBasemap() {
+  const u = styleUrl();
+  if (u === currentStyle) return;
+  currentStyle = u;
+  mapReady = false;
+  map.setStyle(u);
 }
 
-function initMap() {
-  state.map = new maplibregl.Map({
-    container: 'map',
-    style: 'https://demotiles.maplibre.org/style.json',
-    center: [0, 20],
-    zoom: 2,
-    pitch: 0,
-    bearing: 0
-  });
-
-  state.map.on('load', onMapLoad);
-  state.map.on('error', (e) => {
-    console.error('Map error:', e);
-    showError('Map failed to load properly.');
+/* ---------------- arcs ---------------- */
+function arcPoints(a, b, n = 48) {
+  let bl = b[0];
+  while (bl - a[0] > 180) bl -= 360;
+  while (bl - a[0] < -180) bl += 360;
+  const dx = bl - a[0], dy = b[1] - a[1], k = settings.curve;
+  const c = [(a[0] + bl) / 2 - dy * k, (a[1] + b[1]) / 2 + dx * k];
+  return Array.from({ length: n }, (_, i) => {
+    const t = i / (n - 1), u = 1 - t;
+    return [u * u * a[0] + 2 * u * t * c[0] + t * t * bl, u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]];
   });
 }
 
-function onMapLoad() {
-  try {
-    applyDarkMode();
-    hideLoading();
-    addPulseSource();
-    addSourceMarker();
-    addNavigationControls();
-  } catch (error) {
-    console.error('Map initialization error:', error);
-    showError('Map initialization failed.');
-  }
-}
+const colorFor = (type, ip) => (settings.colorMode === 'client' ? colors.get(ip) : TYPE_COLORS[type] ?? TYPE_COLORS.other);
+const dot = (coordinates, c, r, o) => ({ type: 'Feature', properties: { k: 'dst', c, r, o }, geometry: { type: 'Point', coordinates } });
 
-function addPulseSource() {
-  state.map.addSource('pulse-source', {
-    type: 'geojson',
-    data: {
-      type: 'FeatureCollection',
-      features: [{
-        type: 'Feature',
-        geometry: {
-          type: 'Point',
-          coordinates: [state.sourceLocation.lng, state.sourceLocation.lat]
-        }
-      }]
-    }
-  });
+let lastFrame = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!mapReady || now - lastFrame < 33) return;
+  lastFrame = now;
+  const src = map.getSource('atlas');
+  if (!src) return;
+  const s = getSource();
+  const life = settings.lifetime * 1000;
+  const features = [{ type: 'Feature', properties: { k: 'src' }, geometry: { type: 'Point', coordinates: [s.lng, s.lat] } }];
 
-  state.map.addLayer({
-    id: 'pulse-layer',
-    type: 'circle',
-    source: 'pulse-source',
-    paint: {
-      'circle-radius': 20,
-      'circle-color': '#f6ad55',
-      'circle-opacity': 0.8,
-      'circle-blur': 0.5
-    }
-  });
-
-  animatePulse();
-}
-
-function animatePulse() {
-  // Reduced-motion: leave the pulse layer at its static resting appearance.
-  if (prefersReducedMotion()) return;
-
-  let pulsePhase = 0;
-
-  function animate() {
-    try {
-      if (!state.map || !state.map.getLayer('pulse-layer')) return;
-
-      pulsePhase += 0.02;
-      const scale = 1 + Math.sin(pulsePhase) * 0.5;
-      const opacity = 0.8 - Math.abs(Math.sin(pulsePhase)) * 0.6;
-
-      state.map.setPaintProperty('pulse-layer', 'circle-radius', 20 * scale);
-      state.map.setPaintProperty('pulse-layer', 'circle-opacity', opacity);
-
-      requestAnimationFrame(animate);
-    } catch (error) {
-      console.error('Pulse animation error:', error);
-      // Animation stops on error - prevents infinite error loops
+  for (let i = arcs.length - 1; i >= 0; i--) {
+    const a = arcs[i];
+    const p = (now - a.t0) / life;
+    if (p >= 1) { arcs.splice(i, 1); continue; }
+    const last = a.pts.length - 1;
+    let head, tail, o = 1;
+    if (settings.anim === 'fade') { head = Math.min(1, p / 0.3); tail = 0; o = p < 0.5 ? 1 : Math.max(0, 1 - (p - 0.5) * 2); }
+    else { head = p < 0.5 ? p * 2 : 1; tail = p < 0.5 ? 0 : (p - 0.5) * 2; }
+    const c = colorFor(a.type, a.ip);
+    const seg = a.pts.slice(Math.floor(tail * last), Math.ceil(head * last) + 1);
+    if (seg.length >= 2) features.push({ type: 'Feature', properties: { k: 'arc', c, o }, geometry: { type: 'LineString', coordinates: seg } });
+    if (head >= 1) {
+      if (!a.arrivedAt) { a.arrivedAt = now; showLabel(a, c); }
+      const end = a.pts[last];
+      const base = settings.anim === 'fade' ? o : 1 - tail;
+      features.push(dot(end, c, 2.5, base));
+      const q = Math.min(1, (now - a.arrivedAt) / 1200);
+      if (settings.pulse && q < 1) features.push(dot(end, c, 3 + 10 * q, (1 - q) * 0.7 * base));
     }
   }
+  src.setData({ type: 'FeatureCollection', features });
+}
+requestAnimationFrame(frame);
 
-  animate();
+function showLabel(a, color) {
+  if (!settings.labels || labels.size >= 12) return;
+  const el = document.createElement('div');
+  el.className = 'map-label';
+  el.style.setProperty('--c', color);
+  const d = document.createElement('b');
+  d.textContent = a.domain;
+  const where = document.createElement('span');
+  where.textContent = [a.city, a.country].filter((x) => x && x !== 'Unknown').join(', ');
+  el.append(d, where);
+  const m = new maplibregl.Marker({ element: el, anchor: 'left', offset: [10, 0] }).setLngLat(a.pts.at(-1)).addTo(map);
+  labels.add(m);
+  setTimeout(() => { m.remove(); labels.delete(m); }, 2600);
 }
 
-function addSourceMarker() {
-  if (state.sourceMarker) {
-    state.sourceMarker.remove();
-  }
+/* ---------------- incoming data ---------------- */
+function onQuery(m) {
+  const d = m.data;
+  if (!d || typeof d.domain !== 'string') return;
+  if (settings.hideLocal && LOCAL.test(d.domain)) return;
+  stats.total++;
+  if (d.filtered) stats.blocked++;
+  const ms = Number.parseFloat(d.elapsed);
+  if (ms > 0) { stats.msSum += ms; stats.msN++; }
 
-  state.sourceMarker = new maplibregl.Marker({ color: '#f6ad55' })
-    .setLngLat([state.sourceLocation.lng, state.sourceLocation.lat])
-    .setPopup(new maplibregl.Popup().setText(`DNS Source: ${state.sourceLocation.city}`))
-    .addTo(state.map);
-}
+  const ip = typeof d.clientIp === 'string' && d.clientIp ? d.clientIp : 'unknown';
+  const cl = clients.get(ip) ?? { count: 0, last: 0 };
+  cl.count++; cl.last = Date.now();
+  clients.set(ip, cl);
+  if (clients.size > 300) clients.delete(clients.keys().next().value);
+  colors.get(ip);
 
-function addNavigationControls() {
-  state.navigationControl = new maplibregl.NavigationControl();
-  const position = state.isSidebarRight ? 'bottom-left' : 'bottom-right';
-  state.map.addControl(state.navigationControl, position);
-}
+  const type = typeKey(d.queryType);
+  addLog(d, colorFor(type, ip));
 
-function connectWebSocket() {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}`;
-
-  try {
-    state.ws = new WebSocket(wsUrl);
-
-    state.ws.onopen = onWebSocketOpen;
-    state.ws.onmessage = onWebSocketMessage;
-    state.ws.onerror = onWebSocketError;
-    state.ws.onclose = onWebSocketClose;
-  } catch (error) {
-    console.error('WebSocket connection error:', error);
-    scheduleReconnect();
-  }
-}
-
-function onWebSocketOpen() {
-  console.log('WebSocket connected');
-  updateStatus('connected', 'Live');
-  state.reconnectAttempts = 0;
-}
-
-function onWebSocketMessage(event) {
-  try {
-    const data = JSON.parse(event.data);
-
-    if (!data || typeof data !== 'object' || !data.type) {
-      console.warn('Invalid message format:', data);
-      return;
-    }
-
-    handleMessage(data);
-  } catch (error) {
-    console.error('Error parsing WebSocket message:', error);
+  const dest = m.destination;
+  if (mapReady && dest && !d.filtered && Number.isFinite(dest.lat) && Number.isFinite(dest.lng) && arcs.length < settings.maxArcs) {
+    const s = getSource();
+    arcs.push({ pts: arcPoints([s.lng, s.lat], [dest.lng, dest.lat]), type, ip, domain: d.domain, city: dest.city, country: dest.country, t0: performance.now() });
   }
 }
 
-function onWebSocketError(error) {
-  console.error('WebSocket error:', error);
-  updateStatus('disconnected', 'Error');
+function addLog(d, color) {
+  const row = document.createElement('div');
+  row.className = d.filtered ? 'log-row is-blocked' : 'log-row';
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.style.setProperty('--c', color);
+  tag.textContent = String(d.queryType || '?').slice(0, 8);
+  const name = document.createElement('span');
+  name.className = 'log-domain';
+  name.textContent = d.domain;
+  const meta = document.createElement('span');
+  meta.className = 'log-meta';
+  meta.textContent = d.filtered ? 'blocked' : (d.clientIp || '');
+  row.append(tag, name, meta);
+  const log = $('log');
+  log.prepend(row);
+  while (log.children.length > 40) log.lastChild.remove();
 }
 
-function onWebSocketClose(event) {
-  console.log('WebSocket disconnected:', event.code, event.reason);
-  updateStatus('disconnected', 'Disconnected');
-
-  if (event.code !== 1000) {
-    scheduleReconnect();
-  }
-}
-
-function scheduleReconnect() {
-  if (state.reconnectTimeoutId) return;
-
-  if (state.reconnectAttempts >= CONFIG.RECONNECT_MAX_ATTEMPTS) {
-    console.error('Max reconnection attempts reached');
-    showError('Connection lost. Please refresh the page.');
-    return;
-  }
-
-  state.reconnectAttempts++;
-
-  const delay = Math.min(
-    CONFIG.RECONNECT_BASE_DELAY * Math.pow(2, state.reconnectAttempts - 1),
-    CONFIG.RECONNECT_MAX_DELAY
-  );
-
-  console.log(`Reconnecting in ${delay}ms (attempt ${state.reconnectAttempts}/${CONFIG.RECONNECT_MAX_ATTEMPTS})`);
-
-  state.reconnectTimeoutId = setTimeout(() => {
-    state.reconnectTimeoutId = null;
-    connectWebSocket();
-  }, delay);
-}
-
-function handleMessage(data) {
-  switch (data.type) {
-    case 'dns_query':
-      handleDNSQuery(data);
-      break;
-    case 'stats':
-      handleStats(data);
-      break;
+function onMessage(m) {
+  switch (m.type) {
     case 'connected':
-      console.log('Server welcome:', data.message);
-      break;
-    case 'error':
-      console.error('Server error:', data.message);
-      addLogEntry({ domain: 'System Error', details: data.message, isError: true });
-      break;
-    default:
-      console.warn('Unknown message type:', data.type);
-  }
-}
-
-function handleStats(event) {
-  const statAdguardAvg = document.getElementById('stat-adguard-avg');
-
-  if (statAdguardAvg && typeof event.data?.avgProcessingTime === 'number') {
-    const avgTime = event.data.avgProcessingTime.toFixed(2);
-    animateStat(statAdguardAvg, `${avgTime}ms`);
-  }
-}
-
-function handleDNSQuery(event) {
-  if (!event.data || !event.source) {
-    console.warn('Invalid DNS query event:', event);
-    return;
-  }
-
-  if (state.filterLocal && event.data.domain && event.data.domain.toLowerCase().endsWith('.local')) {
-    return;
-  }
-
-  state.totalQueries++;
-  if (event.data.filtered) state.blockedQueries++;
-  updateStats();
-
-  addLogEntry({
-    domain: trimString(event.data.domain),
-    ip: trimString(event.data.ip) || 'No answer',
-    clientIp: trimString(event.data.clientIp),
-    type: trimString(event.data.queryType),
-    elapsed: parseFloat(event.data.elapsed) || 0,
-    cached: event.data.cached || false,
-    filtered: event.data.filtered || false,
-    timestamp: new Date(event.timestamp)
-  });
-
-  if (event.destination && state.activeArcs.length < CONFIG.MAX_CONCURRENT_ARCS) {
-    createArc(event.source, event.destination, event.data);
-  }
-
-  const elapsed = parseFloat(event.data.elapsed);
-  if (!isNaN(elapsed) && elapsed > 0) {
-    state.responseTimes.push(elapsed);
-    if (state.responseTimes.length > CONFIG.MAX_RESPONSE_SAMPLES) {
-      state.responseTimes = state.responseTimes.slice(-CONFIG.MAX_RESPONSE_SAMPLES);
-    }
-  }
-
-  const upstreamElapsed = parseFloat(event.data.upstream);
-  if (!isNaN(upstreamElapsed) && upstreamElapsed > 0) {
-    state.upstreamTimes.push(upstreamElapsed);
-    if (state.upstreamTimes.length > CONFIG.MAX_RESPONSE_SAMPLES) {
-      state.upstreamTimes = state.upstreamTimes.slice(-CONFIG.MAX_RESPONSE_SAMPLES);
-    }
-  }
-}
-
-function createArc(_source, destination, data) {
-  const arcId = `arc-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-  state.activeArcs.push(arcId);
-
-  const arcColor = getColorForDNSType(data.queryType || data.type);
-
-  triggerSourcePulse();
-
-  // Use the custom source location from state instead of the server-provided source
-  const lineString = createArcGeometry(
-    [state.sourceLocation.lng, state.sourceLocation.lat],
-    [destination.lng, destination.lat]
-  );
-
-  try {
-    state.map.addSource(arcId, {
-      type: 'geojson',
-      data: {
-        type: 'Feature',
-        geometry: lineString
+      if (m.config?.source) {
+        serverSource = m.config.source;
+        if (firstConfig) {
+          firstConfig = false;
+          const s = getSource();
+          map.easeTo({ center: [s.lng, Math.max(-50, Math.min(60, s.lat))], zoom: 1.8, duration: 1500 });
+        }
       }
-    });
-
-    state.map.addLayer({
-      id: arcId,
-      type: 'line',
-      source: arcId,
-      paint: {
-        'line-color': arcColor,
-        'line-width': state.isDarkMode ? 2 : 3,
-        'line-opacity': state.isDarkMode ? 0.8 : 0.9,
-        'line-blur': state.isDarkMode ? 0 : 0.5
-      }
-    });
-
-    animateArc(arcId, lineString, destination, data, arcColor);
-  } catch (error) {
-    console.error('Error creating arc:', error);
-    removeArc(arcId);
+      break;
+    case 'dns_query': onQuery(m); break;
+    case 'stats': lastStats = m.data; break;
+    case 'error': addLog({ domain: String(m.message ?? 'Server error'), queryType: 'ERR', filtered: false }, '#f85149'); break;
   }
 }
 
-function createArcGeometry(start, end) {
-  const steps = 50;
-  const coordinates = [];
+/* ---------------- websocket (auto-reconnect forever, back to login if session expired) ---------------- */
+let retry = 0;
+function setConn(state, text) { $('conn').dataset.state = state; $('conn').textContent = text; }
 
-  // Calculate distance for arc height
-  const dx = end[0] - start[0];
-  const dy = end[1] - start[1];
-  const distance = Math.sqrt(dx * dx + dy * dy);
-
-  // Subtle arc height - just a gentle curve
-  const arcHeight = distance * 0.15;
-
-  // Generate path with subtle curve
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-
-    // Linear interpolation for base position
-    const lng = start[0] + (end[0] - start[0]) * t;
-    const lat = start[1] + (end[1] - start[1]) * t;
-
-    // Add subtle parabolic arc height (peaks at midpoint)
-    const height = Math.sin(t * Math.PI) * arcHeight;
-
-    coordinates.push([lng, lat + height]);
-  }
-
-  return {
-    type: 'LineString',
-    coordinates
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
+  ws.onopen = () => { retry = 0; setConn('live', 'Live'); hideLoading(); };
+  ws.onmessage = (ev) => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch { return; }
+    if (m && typeof m === 'object' && m.type) onMessage(m);
+  };
+  ws.onclose = async () => {
+    setConn('connecting', 'Reconnecting');
+    try {
+      const r = await fetch('/api/me', { credentials: 'same-origin' });
+      if (r.status === 401) { location.href = '/login/'; return; }
+    } catch { /* server down: keep retrying */ }
+    retry++;
+    setTimeout(connect, Math.min(1000 * 2 ** retry, 15000));
   };
 }
 
-function animateArc(arcId, lineString, destination, data, arcColor) {
-  const steps = lineString.coordinates.length;
-
-  _scheduleAnimation(
-    arcId,
-    CONFIG.ARC_ANIMATION_DURATION,
-    (t) => {
-      const currentStep = Math.max(1, Math.floor(t * steps));
-      const currentCoords = lineString.coordinates.slice(0, currentStep);
-      if (state.map.getSource(arcId)) {
-        state.map.getSource(arcId).setData({
-          type: 'Feature',
-          geometry: { type: 'LineString', coordinates: currentCoords }
-        });
-      }
-    },
-    () => {
-      addArcLabel(destination, data);
-      createDestinationGlow(destination, arcColor);
-      createArcTrail(lineString, arcColor);
-      setTimeout(() => removeArc(arcId), 3000);
-    }
-  );
-}
-
-function createArcTrail(lineString, arcColor) {
-  for (let i = 0; i < CONFIG.ARC_TRAIL_COUNT; i++) {
-    setTimeout(() => {
-      const trailId = `trail-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const opacity = 0.6 - (i * 0.2);
-
-      try {
-        state.map.addSource(trailId, {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: lineString
-          }
-        });
-
-        state.map.addLayer({
-          id: trailId,
-          type: 'line',
-          source: trailId,
-          paint: {
-            'line-color': arcColor,
-            'line-width': state.isDarkMode ? 1.5 : 2.5,
-            'line-opacity': state.isDarkMode ? opacity : opacity * 1.2,
-            'line-blur': state.isDarkMode ? 0 : 0.5
-          }
-        });
-
-        animateTrailFade(trailId, opacity);
-        setTimeout(() => removeArc(trailId), CONFIG.ARC_TRAIL_LIFETIME);
-      } catch (error) {
-        console.error('Error creating trail:', error);
-      }
-    }, i * 150);
-  }
-}
-
-function animateTrailFade(trailId, initialOpacity) {
-  _scheduleAnimation(
-    `fade-${trailId}`,
-    CONFIG.ARC_TRAIL_LIFETIME,
-    (t) => {
-      if (!state.map.getLayer(trailId)) {
-        _cancelAnimation(`fade-${trailId}`);
-        return;
-      }
-      state.map.setPaintProperty(trailId, 'line-opacity', initialOpacity * (1 - t));
-    },
-    null
-  );
-}
-
-function removeArc(arcId) {
-  _cancelAnimation(arcId); // cancel rAF animation if still running
-  _cancelAnimation(`fade-${arcId}`);
-  try {
-    if (state.map.getLayer(arcId)) {
-      state.map.removeLayer(arcId);
-    }
-    if (state.map.getSource(arcId)) {
-      state.map.removeSource(arcId);
-    }
-  } catch (error) {
-    console.warn('Error removing arc:', error);
-  }
-
-  state.activeArcs = state.activeArcs.filter(id => id !== arcId);
-}
-
-function createDestinationGlow(destination, color) {
-  const glowId = `glow-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-  try {
-    state.map.addSource(glowId, {
-      type: 'geojson',
-      data: {
-        type: 'FeatureCollection',
-        features: [{
-          type: 'Feature',
-          geometry: {
-            type: 'Point',
-            coordinates: [destination.lng, destination.lat]
-          }
-        }]
-      }
-    });
-
-    const glowLayer1 = `${glowId}-1`;
-    const glowLayer2 = `${glowId}-2`;
-
-    state.map.addLayer({
-      id: glowLayer1,
-      type: 'circle',
-      source: glowId,
-      paint: {
-        'circle-radius': 30,
-        'circle-color': color,
-        'circle-opacity': 0.6,
-        'circle-blur': 1
-      }
-    });
-
-    state.map.addLayer({
-      id: glowLayer2,
-      type: 'circle',
-      source: glowId,
-      paint: {
-        'circle-radius': 15,
-        'circle-color': color,
-        'circle-opacity': 0.8,
-        'circle-blur': 0.5
-      }
-    });
-
-    animateGlow(glowId, glowLayer1, glowLayer2);
-  } catch (error) {
-    console.error('Error creating glow:', error);
-  }
-}
-
-function animateGlow(glowId, layer1, layer2) {
-  _scheduleAnimation(
-    `glow-${glowId}`,
-    CONFIG.DESTINATION_GLOW_DURATION,
-    (t) => {
-      const scale = 1 + (t * 2);
-      if (state.map.getLayer(layer1)) {
-        state.map.setPaintProperty(layer1, 'circle-radius', 30 * scale);
-        state.map.setPaintProperty(layer1, 'circle-opacity', 0.6 * (1 - t));
-      }
-      if (state.map.getLayer(layer2)) {
-        state.map.setPaintProperty(layer2, 'circle-radius', 15 * scale);
-        state.map.setPaintProperty(layer2, 'circle-opacity', 0.8 * (1 - t));
-      }
-    },
-    () => {
-      setTimeout(() => {
-        try {
-          if (state.map.getLayer(layer1)) state.map.removeLayer(layer1);
-          if (state.map.getLayer(layer2)) state.map.removeLayer(layer2);
-          if (state.map.getSource(glowId)) state.map.removeSource(glowId);
-        } catch (e) {
-          console.warn('Error cleaning up glow:', e);
-        }
-      }, CONFIG.GLOW_CLEANUP_DELAY_MS);
-    }
-  );
-}
-
-function triggerSourcePulse() {
-  if (state.sourcePulseActive) return;
-
-  state.sourcePulseActive = true;
-
-  try {
-    if (state.map.getLayer('pulse-layer')) {
-      const originalRadius = state.map.getPaintProperty('pulse-layer', 'circle-radius');
-      const originalOpacity = state.map.getPaintProperty('pulse-layer', 'circle-opacity');
-
-      state.map.setPaintProperty('pulse-layer', 'circle-radius', 35);
-      state.map.setPaintProperty('pulse-layer', 'circle-opacity', 1);
-
-      setTimeout(() => {
-        try {
-          if (state.map.getLayer('pulse-layer')) {
-            state.map.setPaintProperty('pulse-layer', 'circle-radius', originalRadius);
-            state.map.setPaintProperty('pulse-layer', 'circle-opacity', originalOpacity);
-          }
-        } catch (error) {
-          console.warn('Error resetting pulse:', error);
-        }
-      }, CONFIG.SOURCE_PULSE_THROTTLE);
-    }
-  } catch (error) {
-    console.warn('Error triggering pulse:', error);
-  }
-
-  setTimeout(() => {
-    state.sourcePulseActive = false;
-  }, CONFIG.SOURCE_PULSE_THROTTLE);
-}
-
-function addArcLabel(destination, data) {
-  if (CONFIG.LABEL_QUEUE_ENABLED && state.activeLabels >= CONFIG.MAX_CONCURRENT_LABELS) {
-    queueLabel(destination, data);
-    return;
-  }
-
-  try {
-    const point = state.map.project([destination.lng, destination.lat]);
-
-    const label = document.createElement('div');
-    label.className = 'arc-label';
-
-    if (data.filtered) label.classList.add('arc-label-priority');
-
-    const domain = sanitizeHTML(data.domain || 'Unknown');
-    const ip = data.ip ? sanitizeHTML(data.ip) : '';
-    const queryType = sanitizeHTML(data.queryType || data.type || 'A');
-    const elapsed = parseFloat(data.elapsed) || 0;
-    const cached = data.cached ? ' • Cached' : '';
-    const city = sanitizeHTML(destination.city || 'Unknown');
-    const country = sanitizeHTML(destination.country || 'Unknown');
-
-    label.innerHTML = `
-      <div class="label-domain">${domain}</div>
-      <div class="label-detail">
-        ${ip ? `<span class="label-ip">${ip}</span> • ` : ''}
-        ${queryType} • ${elapsed}ms${cached}
-      </div>
-      <div class="label-detail">${city}, ${country}</div>
-    `;
-
-    const labelWidth = CONFIG.LABEL_APPROX_WIDTH;
-    const labelHeight = CONFIG.LABEL_APPROX_HEIGHT;
-
-    const position = findNonOverlappingPosition(point.x, point.y, labelWidth, labelHeight);
-
-    if (!position && CONFIG.LABEL_QUEUE_ENABLED) {
-      queueLabel(destination, data);
-      return;
-    }
-
-    label.style.left = `${position.x}px`;
-    label.style.top = `${position.y}px`;
-    label.style.opacity = '0';
-    document.body.appendChild(label);
-    requestAnimationFrame(() => { label.style.opacity = '1'; });
-
-    state.activeLabels++;
-
-    const distance = Math.sqrt(
-      Math.pow(position.x - point.x, 2) +
-      Math.pow(position.y - point.y, 2)
-    );
-
-    let connector = null;
-    if (distance > 50) {
-      connector = createLabelConnector(
-        point.x,
-        point.y,
-        position.x + labelWidth / 2,
-        position.y + labelHeight / 2
-      );
-    }
-
-    const bounds = {
-      left: position.x,
-      top: position.y,
-      right: position.x + labelWidth,
-      bottom: position.y + labelHeight,
-      timestamp: Date.now()
-    };
-    state.activeLabelBounds.push(bounds);
-
-    const lifetime = calculateAdaptiveLifetime();
-
-    setTimeout(() => {
-      if (label.parentNode) label.remove();
-      if (connector && connector.parentNode) connector.remove();
-
-      const index = state.activeLabelBounds.indexOf(bounds);
-      if (index > -1) state.activeLabelBounds.splice(index, 1);
-
-      state.activeLabels--;
-
-      if (CONFIG.LABEL_QUEUE_ENABLED) processLabelQueue();
-    }, lifetime);
-
-    cleanupExpiredLabelBounds();
-  } catch (error) {
-    console.error('Error adding label:', error);
-  }
-}
-
-function findNonOverlappingPosition(x, y, width, height) {
-  const viewportWidth = window.innerWidth;
-  const viewportHeight = window.innerHeight;
-  const padding = CONFIG.LABEL_PADDING;
-
-  const priorityOffsets = [
-    { dx: 0, dy: -30 },
-    { dx: 0, dy: 30 },
-    { dx: -25, dy: -25 },
-    { dx: 25, dy: -25 },
-    { dx: -30, dy: 0 },
-    { dx: 30, dy: 0 },
-  ];
-
-  for (const offset of priorityOffsets) {
-    const testX = x + offset.dx;
-    const testY = y + offset.dy;
-
-    const testBounds = {
-      left: testX,
-      top: testY,
-      right: testX + width,
-      bottom: testY + height
-    };
-
-    if (isValidPosition(testBounds, viewportWidth, viewportHeight) && !hasCollision(testBounds)) {
-      return { x: testX, y: testY };
-    }
-  }
-
-  const angleSteps = CONFIG.LABEL_ANGLE_STEPS;
-  const maxRadius = CONFIG.LABEL_SEARCH_RADIUS;
-  const radiusSteps = 6;
-
-  for (let r = 1; r <= radiusSteps; r++) {
-    const radius = (maxRadius / radiusSteps) * r;
-
-    for (let a = 0; a < angleSteps; a++) {
-      const angle = (Math.PI * 2 * a) / angleSteps;
-      const testX = x + Math.cos(angle) * radius;
-      const testY = y + Math.sin(angle) * radius;
-
-      const testBounds = {
-        left: testX,
-        top: testY,
-        right: testX + width,
-        bottom: testY + height
-      };
-
-      if (isValidPosition(testBounds, viewportWidth, viewportHeight) && !hasCollision(testBounds)) {
-        return { x: testX, y: testY };
-      }
-    }
-  }
-
-  const gridStep = 40;
-  const gridRange = 3;
-
-  for (let gx = -gridRange; gx <= gridRange; gx++) {
-    for (let gy = -gridRange; gy <= gridRange; gy++) {
-      if (gx === 0 && gy === 0) continue;
-
-      const testX = x + gx * gridStep;
-      const testY = y + gy * gridStep;
-
-      const testBounds = {
-        left: testX,
-        top: testY,
-        right: testX + width,
-        bottom: testY + height
-      };
-
-      if (isValidPosition(testBounds, viewportWidth, viewportHeight) && !hasCollision(testBounds)) {
-        return { x: testX, y: testY };
-      }
-    }
-  }
-
-  if (!CONFIG.LABEL_QUEUE_ENABLED) {
-    return { x: x, y: y - 30 }; // Simplified fallback
-  }
-
-  return null;
-}
-
-function isValidPosition(bounds, viewportWidth, viewportHeight) {
-  const margin = 10;
-  return (
-    bounds.left >= margin &&
-    bounds.right <= viewportWidth - margin &&
-    bounds.top >= margin &&
-    bounds.bottom <= viewportHeight - margin
-  );
-}
-
-function hasCollision(bounds) {
-  const padding = CONFIG.LABEL_PADDING;
-
-  for (const existingBounds of state.activeLabelBounds) {
-    if (
-      bounds.left - padding < existingBounds.right + padding &&
-      bounds.right + padding > existingBounds.left - padding &&
-      bounds.top - padding < existingBounds.bottom + padding &&
-      bounds.bottom + padding > existingBounds.top - padding
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function createLabelConnector(x1, y1, x2, y2) {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.style.position = 'absolute';
-  svg.style.top = '0';
-  svg.style.left = '0';
-  svg.style.width = '100%';
-  svg.style.height = '100%';
-  svg.style.pointerEvents = 'none';
-  svg.style.zIndex = '4';
-  svg.classList.add('label-connector');
-
-  const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-  line.setAttribute('x1', x1);
-  line.setAttribute('y1', y1);
-  line.setAttribute('x2', x2);
-  line.setAttribute('y2', y2);
-  line.setAttribute('stroke', state.isDarkMode ? 'rgba(246, 173, 85, 0.3)' : 'rgba(99, 102, 241, 0.3)');
-  line.setAttribute('stroke-width', '1');
-  line.setAttribute('stroke-dasharray', '3,3');
-
-  svg.appendChild(line);
-  document.body.appendChild(svg);
-
-  return svg;
-}
-
-function cleanupExpiredLabelBounds() {
-  const now = Date.now();
-  const maxAge = CONFIG.LABEL_LIFETIME + 1000;
-
-  state.activeLabelBounds = state.activeLabelBounds.filter(
-    bounds => now - bounds.timestamp < maxAge
-  );
-}
-
-function addLogEntry(entry) {
-  try {
-    const container = document.getElementById('log-container');
-    if (!container) return;
-
-    const logDiv = document.createElement('div');
-    const isBlocked = entry.filtered === true;
-    const isNoAnswer = entry.ip === 'No Answer';
-
-    if (isBlocked) {
-      logDiv.className = 'log-entry blocked';
-    } else if (isNoAnswer) {
-      logDiv.className = 'log-entry no-answer';
-    } else {
-      logDiv.className = 'log-entry';
-    }
-
-    const time = entry.timestamp ? entry.timestamp.toLocaleTimeString() : new Date().toLocaleTimeString();
-    const domain = sanitizeHTML(entry.domain || 'Unknown');
-    const ip = entry.ip ? sanitizeHTML(entry.ip) : '';
-    const clientIp = entry.clientIp ? sanitizeHTML(entry.clientIp) : '';
-    const type = sanitizeHTML(entry.type || 'A');
-    const elapsed = entry.elapsed ? `${entry.elapsed}ms` : '';
-    const cached = entry.cached ? ' • Cached' : '';
-    const blocked = isBlocked ? ' • <span class="log-blocked">BLOCKED</span>' : '';
-    const noAnswer = isNoAnswer ? ' • <span class="log-no-answer">NO ANSWER</span>' : '';
-    const cnameInfo = entry.cname ? ` • <span class="log-cname" title="Resolved from CNAME: ${sanitizeHTML(entry.cname)}">CNAME</span>` : '';
-    const details = entry.details ? sanitizeHTML(entry.details) : '';
-
-    logDiv.innerHTML = `
-      <div class="log-time">${time}${clientIp ? ` • <span class="log-client">${clientIp}</span>` : ''}</div>
-      <div class="log-domain">${domain}${cnameInfo}</div>
-      <div class="log-details">
-        ${ip ? `<span class="log-ip">${ip}</span> • ` : ''}
-        ${type}${elapsed ? ` • ${elapsed}` : ''}${cached}${blocked}${noAnswer}
-        ${details ? ` • ${details}` : ''}
-      </div>
-    `;
-
-    container.insertBefore(logDiv, container.firstChild);
-    state.logEntries.push(logDiv);
-
-    setTimeout(() => {
-      if (logDiv.parentNode) logDiv.remove();
-    }, 5000);
-
-    while (state.logEntries.length > CONFIG.MAX_LOG_ENTRIES) {
-      const oldEntry = state.logEntries.shift();
-      if (oldEntry && oldEntry.parentNode) oldEntry.remove();
-    }
-  } catch (error) {
-    console.error('Error adding log entry:', error);
-  }
-}
-
-function updateStatus(status, text) {
-  try {
-    const indicator = document.getElementById('status-indicator');
-    const statusText = document.getElementById('status-text');
-    const indicatorTop = document.getElementById('status-indicator-top');
-    const statusTextTop = document.getElementById('status-text-top');
-
-    if (indicator) {
-      indicator.className = `status-indicator ${status === 'disconnected' ? 'disconnected' : ''}`;
-    }
-
-    if (indicatorTop) {
-      indicatorTop.className = `status-indicator ${status === 'disconnected' ? 'disconnected' : ''}`;
-    }
-
-    if (statusText) {
-      statusText.textContent = trimString(text);
-    }
-
-    if (statusTextTop) {
-      statusTextTop.textContent = trimString(text);
-    }
-  } catch (error) {
-    console.error('Error updating status:', error);
-  }
-}
-
-function updateStats() {
-  try {
-    const statActive = document.getElementById('stat-active');
-    const statTotal = document.getElementById('stat-total');
-    const statBlocked = document.getElementById('stat-blocked');
-    const statAvg = document.getElementById('stat-avg');
-    const statUpstreamAvg = document.getElementById('stat-upstream-avg');
-
-    animateStat(statActive, state.activeArcs.length.toString());
-    animateStat(statTotal, state.totalQueries.toString());
-    animateStat(statBlocked, state.blockedQueries.toString());
-
-    if (state.responseTimes.length > 0) {
-      const sum = state.responseTimes.reduce((a, b) => a + b, 0);
-      const avg = sum / state.responseTimes.length;
-
-      if (!isNaN(avg) && isFinite(avg)) {
-        animateStat(statAvg, `${avg.toFixed(1)}ms`);
-      } else {
-        animateStat(statAvg, '0ms');
-      }
-    } else {
-      animateStat(statAvg, '0ms');
-    }
-
-    if (state.upstreamTimes.length > 0) {
-      const sum = state.upstreamTimes.reduce((a, b) => a + b, 0);
-      const avg = sum / state.upstreamTimes.length;
-
-      if (!isNaN(avg) && isFinite(avg)) {
-        animateStat(statUpstreamAvg, `${avg.toFixed(1)}ms`);
-      } else {
-        animateStat(statUpstreamAvg, '0ms');
-      }
-    } else {
-      animateStat(statUpstreamAvg, '0ms');
-    }
-  } catch (error) {
-    console.error('Error updating stats:', error);
-  }
-}
-
-function animateStat(element, newValue) {
-  if (!element) return;
-
-  try {
-    if (element.textContent !== newValue) {
-      element.textContent = newValue;
-      element.classList.add('updated');
-      setTimeout(() => element.classList.remove('updated'), 600);
-    }
-  } catch (error) {
-    console.error('Error animating stat:', error);
-  }
-}
-
-function toggleTheme() {
-  state.isDarkMode = !state.isDarkMode;
-  const themeIcon = document.getElementById('theme-icon');
-
-  if (state.isDarkMode) {
-    if (themeIcon) themeIcon.textContent = '☀️';
-    document.body.classList.remove('light-mode');
-
-    if (state.map && state.map.isStyleLoaded()) {
-      applyDarkMode();
-    } else if (state.map) {
-      state.map.once('load', applyDarkMode);
+/* ---------------- sidebar rendering ---------------- */
+const clear = (el) => el.replaceChildren();
+
+function renderLegend() {
+  const box = $('legend');
+  clear(box);
+  if (settings.colorMode === 'client') {
+    const list = [...clients].sort((a, b) => b[1].last - a[1].last).slice(0, 8);
+    if (!list.length) { box.textContent = 'Waiting for clients…'; return; }
+    for (const [ip, c] of list) {
+      const row = document.createElement('div');
+      row.className = 'leg-row';
+      const sw = document.createElement('i'); sw.style.setProperty('--c', colors.get(ip));
+      const name = document.createElement('span'); name.textContent = ip;
+      const n = document.createElement('em'); n.textContent = c.count;
+      row.append(sw, name, n);
+      box.append(row);
     }
   } else {
-    if (themeIcon) themeIcon.textContent = '🌙';
-    document.body.classList.add('light-mode');
-
-    if (state.map) {
-      const currentCenter = state.map.getCenter();
-      const currentZoom = state.map.getZoom();
-
-      state.map.setStyle('https://demotiles.maplibre.org/style.json');
-
-      state.map.once('styledata', () => {
-        state.map.setCenter(currentCenter);
-        state.map.setZoom(currentZoom);
-      });
+    for (const [t, c] of Object.entries(TYPE_COLORS)) {
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      const sw = document.createElement('i'); sw.style.setProperty('--c', c);
+      chip.append(sw, t === 'other' ? 'Other' : t);
+      box.append(chip);
     }
   }
-
-  savePreference('theme', state.isDarkMode ? 'dark' : 'light');
 }
 
-function toggleSidebarPosition() {
-  state.isSidebarRight = !state.isSidebarRight;
-
-  if (state.isSidebarRight) {
-    document.body.classList.add('sidebar-right');
-  } else {
-    document.body.classList.remove('sidebar-right');
-  }
-
-  if (state.navigationControl && state.map) {
-    state.map.removeControl(state.navigationControl);
-    const newPosition = state.isSidebarRight ? 'bottom-left' : 'bottom-right';
-    state.map.addControl(state.navigationControl, newPosition);
-  }
-
-  savePreference('sidebarPosition', state.isSidebarRight ? 'right' : 'left');
-}
-
-function toggleSidebarVisibility() {
-  const isHidden = document.body.classList.toggle('sidebar-hidden');
-  savePreference('sidebarHidden', isHidden ? 'true' : 'false');
-}
-
-function applyDarkMode() {
-  if (!state.map || !state.map.isStyleLoaded()) {
-    if (state.map) {
-      state.map.once('styledata', applyDarkMode);
-    }
-    return;
-  }
-
-  try {
-    const layers = state.map.getStyle().layers;
-
-    layers.forEach(layer => {
-      try {
-        if (layer.type === 'background') {
-          state.map.setPaintProperty(layer.id, 'background-color', '#0a0e27');
-        } else if (layer.type === 'fill') {
-          if (layer.id.includes('water') || layer['source-layer'] === 'water') {
-            state.map.setPaintProperty(layer.id, 'fill-color', '#0F1824');
-            state.map.setPaintProperty(layer.id, 'fill-opacity', 0.8);
-          } else {
-            state.map.setPaintProperty(layer.id, 'fill-color', '#1A2333');
-            state.map.setPaintProperty(layer.id, 'fill-outline-color', '#2D3748');
-            state.map.setPaintProperty(layer.id, 'fill-opacity', 0.7);
-          }
-        } else if (layer.type === 'line') {
-          if (layer.id.includes('boundary') || layer.id.includes('admin')) {
-            state.map.setPaintProperty(layer.id, 'line-color', '#374151');
-            state.map.setPaintProperty(layer.id, 'line-blur', 1.5);
-            state.map.setPaintProperty(layer.id, 'line-opacity', 0.3);
-            state.map.setPaintProperty(layer.id, 'line-width', 0.8);
-          } else {
-            state.map.setPaintProperty(layer.id, 'line-color', '#1F2937');
-            state.map.setPaintProperty(layer.id, 'line-opacity', 0.1);
-          }
-        } else if (layer.type === 'symbol' && layer.layout?.['text-field']) {
-          state.map.setPaintProperty(layer.id, 'text-color', '#546E7A');
-          state.map.setPaintProperty(layer.id, 'text-halo-color', '#0a0e27');
-          state.map.setPaintProperty(layer.id, 'text-halo-width', 2);
-          state.map.setPaintProperty(layer.id, 'text-halo-blur', 1);
-          state.map.setPaintProperty(layer.id, 'text-opacity', 0.4);
-        }
-      } catch (error) {
-        console.warn('applyDarkMode: failed to set paint property on layer', layer.id, error);
-      }
-    });
-  } catch (error) {
-    console.error('Error applying dark mode:', error);
+function renderTop() {
+  const box = $('top');
+  clear(box);
+  const src = { domains: lastStats?.topQueriedDomains, blocked: lastStats?.topBlockedDomains, clients: lastStats?.topClients }[activeTab];
+  const items = (Array.isArray(src) ? src : []).slice(0, 8).map((o) => Object.entries(o ?? {})[0]).filter(Boolean);
+  if (!items.length) { box.textContent = 'No data yet…'; return; }
+  const max = Math.max(...items.map(([, n]) => Number(n) || 0), 1);
+  for (const [name, n] of items) {
+    const row = document.createElement('div');
+    row.className = 'top-row';
+    row.style.setProperty('--w', `${Math.round(((Number(n) || 0) / max) * 100)}%`);
+    if (activeTab === 'clients') { const sw = document.createElement('i'); sw.style.setProperty('--c', colors.get(name)); row.append(sw); }
+    const label = document.createElement('span'); label.textContent = name;
+    const count = document.createElement('em'); count.textContent = n;
+    row.append(label, count);
+    box.append(row);
   }
 }
 
-function getColorForDNSType(type) {
-  return DNS_TYPE_COLORS[type] || DNS_TYPE_COLORS.A;
+setInterval(() => {
+  $('s-active').textContent = arcs.length;
+  $('s-total').textContent = stats.total.toLocaleString();
+  $('s-blocked').textContent = stats.blocked.toLocaleString();
+  $('s-blocked-l').textContent = stats.total ? `Blocked · ${Math.round((stats.blocked / stats.total) * 100)}%` : 'Blocked';
+  $('s-ms').textContent = stats.msN ? Math.round(stats.msSum / stats.msN) : 0;
+  renderLegend();
+  renderTop();
+}, 1000);
+
+/* ---------------- controls ---------------- */
+function syncMode() {
+  for (const b of $('color-mode').children) b.classList.toggle('on', b.dataset.mode === settings.colorMode);
+  renderLegend();
 }
 
-function trimString(str) {
-  if (typeof str !== 'string') return '';
-  return str.trim();
+function onSettingChange(key) {
+  saveSettings(settings);
+  applyTheme();
+  if (key === 'preset' || key === 'basemap') refreshBasemap();
+  if (key === 'globe') applyProjection();
+  if (key === 'colorMode') syncMode();
+  if (mapReady) applyArcPaint();
 }
 
-function sanitizeHTML(str) {
-  if (typeof str !== 'string') return '';
-  const div = document.createElement('div');
-  div.textContent = str;
-  // textContent->innerHTML escapes <, >, & but NOT quotes; escape them too so the
-  // result is safe inside double/single-quoted HTML attribute contexts as well.
-  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+for (const b of $('color-mode').children) {
+  b.addEventListener('click', () => { settings.colorMode = b.dataset.mode; onSettingChange('colorMode'); ui.refresh(); });
 }
-
-function savePreference(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch (error) {
-    console.warn('Failed to save preference:', error);
-  }
-}
-
-function hideLoading() {
-  const loading = document.getElementById('loading');
-  if (loading) {
-    loading.style.display = 'none';
-  }
-}
-
-function showError(message) {
-  console.error('Application error:', message);
-  addLogEntry({
-    domain: 'Application Error',
-    details: message,
-    isError: true
+for (const b of $('tabs').children) {
+  b.addEventListener('click', () => {
+    activeTab = b.dataset.tab;
+    for (const x of $('tabs').children) x.classList.toggle('on', x === b);
+    renderTop();
   });
 }
-
-function cleanup() {
-  if (state.ws) {
-    state.ws.close(1000, 'Page unload');
-  }
-
-  if (state.reconnectTimeoutId) {
-    clearTimeout(state.reconnectTimeoutId);
-  }
-
-  if (state.statsUpdateIntervalId) {
-    clearInterval(state.statsUpdateIntervalId);
-  }
-
-  if (_rafId !== null) {
-    cancelAnimationFrame(_rafId);
-    _rafId = null;
-  }
-  _animations.clear();
-}
-
-window.addEventListener('error', (event) => {
-  console.error('Global error:', event.error);
-  showError('An unexpected error occurred.');
+$('btn-hide').addEventListener('click', () => { settings.sidebarHidden = true; onSettingChange('sidebarHidden'); });
+$('show-panel').addEventListener('click', () => { settings.sidebarHidden = false; onSettingChange('sidebarHidden'); });
+$('btn-logout').addEventListener('click', async () => {
+  try { await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' }); }
+  finally { location.href = '/login/'; }
 });
 
-window.addEventListener('unhandledrejection', (event) => {
-  console.error('Unhandled promise rejection:', event.reason);
-  showError('An unexpected error occurred.');
+const ui = initSettingsUI({
+  settings, defaults: DEFAULTS, presets: PRESETS,
+  onChange: onSettingChange,
+  getServerSource: () => serverSource
 });
-
-function queueLabel(destination, data) {
-  // Prevent queue from growing unbounded
-  if (state.labelQueue.length >= CONFIG.MAX_LABEL_QUEUE_SIZE) {
-    // Try to remove low-priority items first, otherwise remove oldest
-    const lowPriorityIndex = state.labelQueue.findIndex(item => item.priority === 0);
-    if (lowPriorityIndex !== -1) {
-      state.labelQueue.splice(lowPriorityIndex, 1);
-    } else {
-      state.labelQueue.shift();
-    }
-  }
-
-  const priority = (CONFIG.LABEL_PRIORITY_BLOCKED && data.filtered) ? 1 : 0;
-
-  state.labelQueue.push({
-    destination,
-    data,
-    priority,
-    timestamp: Date.now()
-  });
-}
-
-function processLabelQueue() {
-  if (state.labelQueue.length === 0) return;
-  if (state.activeLabels >= CONFIG.MAX_CONCURRENT_LABELS) return;
-
-  state.labelQueue.sort((a, b) => {
-    if (b.priority !== a.priority) {
-      return b.priority - a.priority;
-    }
-    return a.timestamp - b.timestamp;
-  });
-
-  const nextLabel = state.labelQueue.shift();
-  if (nextLabel) {
-    addArcLabel(nextLabel.destination, nextLabel.data);
-  }
-}
-
-function calculateAdaptiveLifetime() {
-  const congestionRatio = state.activeLabels / CONFIG.MAX_CONCURRENT_LABELS;
-
-  if (congestionRatio > 0.8) {
-    return CONFIG.LABEL_LIFETIME_MIN;
-  } else if (congestionRatio > 0.5) {
-    const range = CONFIG.LABEL_LIFETIME - CONFIG.LABEL_LIFETIME_MIN;
-    return CONFIG.LABEL_LIFETIME_MIN + (range * (1 - congestionRatio) * 2);
-  } else {
-    return CONFIG.LABEL_LIFETIME;
-  }
-}
-
-// Modal Functions
-function setupModalEventListeners() {
-  const sourceLocationModal = document.getElementById('source-location-modal');
-  const modalCloseBtn = document.getElementById('modal-close-btn');
-  const modalBackdrop = sourceLocationModal?.querySelector('.modal-backdrop');
-  const saveSourceBtn = document.getElementById('save-source-btn');
-  const resetSourceBtn = document.getElementById('reset-source-btn');
-
-  if (modalCloseBtn) {
-    modalCloseBtn.addEventListener('click', closeSourceLocationModal);
-  }
-
-  if (modalBackdrop) {
-    modalBackdrop.addEventListener('click', closeSourceLocationModal);
-  }
-
-  if (saveSourceBtn) {
-    saveSourceBtn.addEventListener('click', saveSourceLocation);
-  }
-
-  if (resetSourceBtn) {
-    resetSourceBtn.addEventListener('click', resetSourceLocation);
-  }
-
-
-  // Populate city presets
-  populateCityPresets();
-
-  // Handle city preset selection
-  const cityPreset = document.getElementById('city-preset');
-  if (cityPreset) {
-    cityPreset.addEventListener('change', handleCityPresetChange);
-  }
-
-  // Handle coordinate input validation
-  const sourceLat = document.getElementById('source-lat');
-  const sourceLng = document.getElementById('source-lng');
-  if (sourceLat) sourceLat.addEventListener('input', validateCoordinates);
-  if (sourceLng) sourceLng.addEventListener('input', validateCoordinates);
-}
-
-// Element focused before the modal opened, so focus can be restored on close.
-let modalPreviousFocus = null;
-
-function getModalFocusable(modal) {
-  return Array.from(modal.querySelectorAll(
-    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-  )).filter(el => !el.disabled && el.offsetParent !== null);
-}
-
-function handleModalKeydown(e) {
-  const modal = document.getElementById('source-location-modal');
-  if (!modal || !modal.classList.contains('active')) return;
-
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    closeSourceLocationModal();
-    return;
-  }
-
-  if (e.key === 'Tab') {
-    const focusable = getModalFocusable(modal);
-    if (focusable.length === 0) return;
-
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  }
-}
-
-function openSourceLocationModal() {
-  const modal = document.getElementById('source-location-modal');
-  if (modal) {
-    modalPreviousFocus = document.activeElement;
-    modal.classList.add('active');
-    // Load current values
-    loadCurrentSourceLocation();
-
-    document.addEventListener('keydown', handleModalKeydown);
-
-    // Move focus into the dialog for keyboard/screen-reader users
-    const focusable = getModalFocusable(modal);
-    if (focusable.length > 0) focusable[0].focus();
-  }
-}
-
-function closeSourceLocationModal() {
-  const modal = document.getElementById('source-location-modal');
-  if (modal) {
-    modal.classList.remove('active');
-    document.removeEventListener('keydown', handleModalKeydown);
-
-    // Restore focus to whatever triggered the modal
-    if (modalPreviousFocus && typeof modalPreviousFocus.focus === 'function') {
-      modalPreviousFocus.focus();
-    }
-    modalPreviousFocus = null;
-  }
-}
-
-function populateCityPresets() {
-  const cityPreset = document.getElementById('city-preset');
-  if (!cityPreset) return;
-
-  const cities = [
-    { name: 'Kuala Lumpur, Malaysia', lat: 3.139, lng: 101.6869 },
-    { name: 'New York, USA', lat: 40.7128, lng: -74.0060 },
-    { name: 'London, UK', lat: 51.5074, lng: -0.1278 },
-    { name: 'Tokyo, Japan', lat: 35.6762, lng: 139.6503 },
-    { name: 'Singapore', lat: 1.3521, lng: 103.8198 },
-    { name: 'Sydney, Australia', lat: -33.8688, lng: 151.2093 },
-    { name: 'Paris, France', lat: 48.8566, lng: 2.3522 },
-    { name: 'Berlin, Germany', lat: 52.5200, lng: 13.4050 },
-    { name: 'Dubai, UAE', lat: 25.2048, lng: 55.2708 },
-    { name: 'Hong Kong', lat: 22.3193, lng: 114.1694 },
-    { name: 'San Francisco, USA', lat: 37.7749, lng: -122.4194 },
-    { name: 'Toronto, Canada', lat: 43.6532, lng: -79.3832 }
-  ];
-
-  cities.forEach(city => {
-    const option = document.createElement('option');
-    option.value = JSON.stringify({ lat: city.lat, lng: city.lng, name: city.name });
-    option.textContent = city.name;
-    cityPreset.appendChild(option);
-  });
-}
-
-function handleCityPresetChange(e) {
-  if (!e.target.value) return;
-
-  try {
-    const city = JSON.parse(e.target.value);
-    const sourceLat = document.getElementById('source-lat');
-    const sourceLng = document.getElementById('source-lng');
-    const sourceCity = document.getElementById('source-city');
-
-    if (sourceLat) sourceLat.value = city.lat;
-    if (sourceLng) sourceLng.value = city.lng;
-    if (sourceCity) sourceCity.value = city.name;
-
-    validateCoordinates();
-  } catch (error) {
-    console.error('Error parsing city preset:', error);
-  }
-}
-
-function validateCoordinates() {
-  const sourceLat = document.getElementById('source-lat');
-  const sourceLng = document.getElementById('source-lng');
-  const validationMessage = document.getElementById('validation-message');
-
-  if (!sourceLat || !sourceLng || !validationMessage) return;
-
-  const lat = parseFloat(sourceLat.value);
-  const lng = parseFloat(sourceLng.value);
-
-  if (isNaN(lat) || isNaN(lng)) {
-    validationMessage.textContent = '';
-    validationMessage.style.color = '';
-    return;
-  }
-
-  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-    validationMessage.textContent = '⚠️ Invalid coordinates. Lat: -90 to 90, Lng: -180 to 180';
-    validationMessage.style.color = '#f87171';
-  } else {
-    validationMessage.textContent = '✓ Valid coordinates';
-    validationMessage.style.color = '#34d399';
-  }
-}
-
-function loadCurrentSourceLocation() {
-  const sourceLat = document.getElementById('source-lat');
-  const sourceLng = document.getElementById('source-lng');
-  const sourceCity = document.getElementById('source-city');
-
-  if (sourceLat) sourceLat.value = state.sourceLocation.lat;
-  if (sourceLng) sourceLng.value = state.sourceLocation.lng;
-  if (sourceCity) sourceCity.value = state.sourceLocation.city;
-}
-
-function saveSourceLocation() {
-  const sourceLat = document.getElementById('source-lat');
-  const sourceLng = document.getElementById('source-lng');
-  const sourceCity = document.getElementById('source-city');
-
-  if (!sourceLat || !sourceLng) return;
-
-  const lat = parseFloat(sourceLat.value);
-  const lng = parseFloat(sourceLng.value);
-
-  if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-    alert('Please enter valid coordinates');
-    return;
-  }
-
-  // Update state
-  state.sourceLocation = {
-    lat,
-    lng,
-    city: sourceCity?.value || 'Custom Location'
-  };
-
-  // Save to localStorage
-  localStorage.setItem('sourceLocation', JSON.stringify(state.sourceLocation));
-
-  // Update the map immediately
-  updateSourceLocationOnMap();
-
-  closeSourceLocationModal();
-}
-
-function resetSourceLocation() {
-  state.sourceLocation = { lat: 3.139, lng: 101.6869, city: 'Kuala Lumpur' };
-  localStorage.removeItem('sourceLocation');
-  loadCurrentSourceLocation();
-  updateSourceLocationOnMap();
-}
-
-function updateSourceLocationOnMap() {
-  if (!state.map) return;
-
-  // Update pulse source
-  const pulseSource = state.map.getSource('pulse-source');
-  if (pulseSource) {
-    pulseSource.setData({
-      type: 'FeatureCollection',
-      features: [{
-        type: 'Feature',
-        geometry: {
-          type: 'Point',
-          coordinates: [state.sourceLocation.lng, state.sourceLocation.lat]
-        }
-      }]
-    });
-  }
-
-  // Update marker
-  if (state.sourceMarker) {
-    state.sourceMarker.setLngLat([state.sourceLocation.lng, state.sourceLocation.lat]);
-    state.sourceMarker.setPopup(new maplibregl.Popup().setText(`DNS Source: ${state.sourceLocation.city}`));
-  }
-
-  // Optionally pan to the new location
-  state.map.flyTo({
-    center: [state.sourceLocation.lng, state.sourceLocation.lat],
-    zoom: Math.max(state.map.getZoom(), 4),
-    duration: 2000
-  });
-}
-
-function cycleLayout() {
-  const layouts = ['full', 'minimal', 'compact'];
-  const currentLayout = localStorage.getItem('dashboardLayout') || 'full';
-  const currentIndex = layouts.indexOf(currentLayout);
-  const nextIndex = (currentIndex + 1) % layouts.length;
-  const nextLayout = layouts[nextIndex];
-
-  localStorage.setItem('dashboardLayout', nextLayout);
-  applyLayout(nextLayout);
-
-  // Show a brief notification
-  showLayoutNotification(nextLayout);
-}
-
-function showLayoutNotification(layout) {
-  const layoutNames = {
-    full: 'Full Layout',
-    minimal: 'Minimal Layout',
-    compact: 'Compact Layout'
-  };
-
-  // Create notification element if it doesn't exist
-  let notification = document.getElementById('layout-notification');
-  if (!notification) {
-    notification = document.createElement('div');
-    notification.id = 'layout-notification';
-    notification.className = 'layout-notification';
-    document.body.appendChild(notification);
-  }
-
-  notification.textContent = layoutNames[layout];
-  notification.classList.add('show');
-
-  // Remove after 2 seconds
-  setTimeout(() => {
-    notification.classList.remove('show');
-  }, 2000);
-}
-
-function applyLayout(layout) {
-  const sidebar = document.querySelector('.sidebar');
-
-  if (!sidebar) return;
-
-  // Remove all layout classes
-  sidebar.classList.remove('layout-full', 'layout-minimal', 'layout-compact');
-
-  // Add the selected layout class
-  if (layout !== 'full') {
-    sidebar.classList.add(`layout-${layout}`);
-  }
-}
+$('btn-settings').addEventListener('click', () => ui.open());
+
+applyTheme();
+syncMode();
+connect();

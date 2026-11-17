@@ -1,0 +1,23 @@
+services:
+  adguard-atlas:
+    build: .
+    image: adguard-atlas:local
+    container_name: adguard-atlas
+    env_file: .env
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach AdGuard Home running on the Docker host
+    volumes:
+      - atlas-data:/data                       # persists 2FA configuration
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  atlas-data:

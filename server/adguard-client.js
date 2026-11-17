@@ -1,4 +1,3 @@
-import fetch from 'node-fetch';
 import dns from 'dns/promises';
 
 // Proportion of total query time attributed to upstream DNS (non-cached queries with upstream server)

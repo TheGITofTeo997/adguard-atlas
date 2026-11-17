@@ -3,18 +3,26 @@ import { WebSocketServer } from 'ws';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
+import crypto from 'crypto';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import AdGuardClient from './adguard-client.js';
 import GeoService from './geo-service.js';
+import { createAuth } from './auth.js';
+import { createStore } from './store.js';
+import { createSecurityRoutes } from './security.js';
 
-dotenv.config();
+try { process.loadEnvFile(); } catch { /* no .env file: rely on real environment */ }
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const parseEnvInt = (val) => val ? parseInt(val, 10) : undefined;
+
+const envFloat = (v, d) => {
+  const n = Number.parseFloat(v);
+  return Number.isFinite(n) ? n : d;
+};
 
 const config = {
   port: parseEnvInt(process.env.PORT) || 8080,
@@ -23,10 +31,14 @@ const config = {
   maxProcessedIds: parseEnvInt(process.env.MAX_PROCESSED_IDS) || 1000,
   maxConcurrentArcs: parseEnvInt(process.env.MAX_CONCURRENT_ARCS) || 50,
   maxConnections: parseEnvInt(process.env.MAX_WS_CONNECTIONS) || 50,
-  sourceLat: parseFloat(process.env.SOURCE_LAT) || 3.139,
-  sourceLng: parseFloat(process.env.SOURCE_LNG) || 101.6869,
+  sourceLat: envFloat(process.env.SOURCE_LAT, 0),
+  sourceLng: envFloat(process.env.SOURCE_LNG, 0),
   nodeEnv: process.env.NODE_ENV || 'development'
 };
+
+if (!Number.isFinite(Number.parseFloat(process.env.SOURCE_LAT)) || !Number.isFinite(Number.parseFloat(process.env.SOURCE_LNG))) {
+  console.warn('⚠️  SOURCE_LAT / SOURCE_LNG not set (or invalid): using 0,0. Set them in .env or override the location in the UI settings.');
+}
 
 const requiredEnvVars = ['ADGUARD_URL', 'ADGUARD_USERNAME', 'ADGUARD_PASSWORD'];
 const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]?.trim());
@@ -54,6 +66,22 @@ const geoService = new GeoService(config.sourceLat, config.sourceLng, {
   sourceCity: process.env.SOURCE_CITY,
   sourceCountry: process.env.SOURCE_COUNTRY
 });
+
+let dashboardPassword = process.env.DASHBOARD_PASSWORD;
+if (!dashboardPassword) {
+  dashboardPassword = crypto.randomBytes(12).toString('base64url');
+  console.warn(`⚠️  DASHBOARD_PASSWORD not set. Temporary password for this run: ${dashboardPassword}`);
+}
+const dashboardUser = process.env.DASHBOARD_USER || 'admin';
+const secureCookie = process.env.COOKIE_SECURE === 'true';
+const auth = createAuth({
+  user: dashboardUser,
+  password: dashboardPassword,
+  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
+  secure: secureCookie
+});
+const store = createStore(process.env.NODE_ENV === 'test' ? null : (process.env.DATA_DIR || path.join(__dirname, '../data')));
+const security = createSecurityRoutes({ auth, store, user: dashboardUser });
 
 class DNSPoller {
   constructor(adguardClient, geoService, config) {
@@ -302,44 +330,75 @@ const app = express();
 const server = http.createServer(app);
 const poller = new DNSPoller(adguardClient, geoService, config);
 
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY;
+  app.set('trust proxy', /^\d+$/.test(tp) ? Number(tp) : tp);
+}
+
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "https://fonts.googleapis.com", "https://unpkg.com"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      scriptSrc: ["'self'", "https://unpkg.com"],
-      connectSrc: ["'self'", "https://unpkg.com", "https://demotiles.maplibre.org"],
-      imgSrc: ["'self'", "data:", "https:", "blob:"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      styleSrcAttr: ["'unsafe-inline'"],
+      fontSrc: ["'self'"],
+      connectSrc: ["'self'", "https://demotiles.maplibre.org", "https://basemaps.cartocdn.com", "https://*.basemaps.cartocdn.com"],
+      imgSrc: ["'self'", "data:", "blob:", "https://demotiles.maplibre.org", "https://basemaps.cartocdn.com", "https://*.basemaps.cartocdn.com"],
       workerSrc: ["'self'", "blob:"],
       childSrc: ["'self'", "blob:"],
       upgradeInsecureRequests: null
     }
   },
-  crossOriginEmbedderPolicy: false
+  crossOriginEmbedderPolicy: false,
+  strictTransportSecurity: secureCookie
 }));
+
+// Health check: unauthenticated and outside the rate limiter (used by Docker)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: config.nodeEnv === 'production' ? 100 : 1000,
+  limit: config.nodeEnv === 'production' ? 300 : 1000,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false
 });
-
 app.use(limiter);
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
+security.publicRoutes(app);
+
+// Login page is the only public content; everything below requires a session
+app.use('/login', express.static(path.join(__dirname, '../login')));
+app.use(auth.require);
+security.protectedRoutes(app);
+
+app.get('/api/me', (req, res) => res.status(204).end());
+app.use('/vendor/maplibre-gl', express.static(path.join(__dirname, '../node_modules/maplibre-gl/dist'), {
+  setHeaders: (res, file) => { if (file.endsWith('.mjs')) res.type('text/javascript'); }
+}));
 app.use(express.static(path.join(__dirname, '../public')));
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    connections: poller.activeConnections.size
-  });
-});
+const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
 
-const wss = new WebSocketServer({ server });
+// Authenticate the WebSocket upgrade: valid session cookie + same-origin
+// (prevents cross-site WebSocket hijacking and anonymous LAN access).
+server.on('upgrade', (req, socket, head) => {
+  let originOk = true;
+  if (req.headers.origin) {
+    try { originOk = new URL(req.headers.origin).host === req.headers.host; } catch { originOk = false; }
+  }
+  const pathOk = (req.url || '').split('?')[0] === '/ws';
+  if (!pathOk || !originOk || !auth.fromReq(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
 
 wss.on('connection', (ws, req) => {
   const clientIp = req.socket.remoteAddress;
@@ -371,10 +430,11 @@ wss.on('connection', (ws, req) => {
 
   ws.send(JSON.stringify({
     type: 'connected',
-    message: 'Connected to DNS Visualization Server',
+    message: 'Connected to AdGuard Atlas Server',
     config: {
       pollInterval: config.pollInterval,
-      maxConcurrentArcs: config.maxConcurrentArcs
+      maxConcurrentArcs: config.maxConcurrentArcs,
+      source: geoService.getSource()
     }
   }));
 });
@@ -407,12 +467,12 @@ export { DNSPoller };
 if (process.env.NODE_ENV !== 'test') {
   server.listen(config.port, () => {
     const sourceCity = process.env.SOURCE_CITY || 'configured location';
-    console.log(`\n🚀 DNS Visualization Dashboard`);
+    console.log(`\n🚀 AdGuard Atlas`);
     console.log(`📡 Server running on http://localhost:${config.port}`);
     console.log(`🔄 Polling interval: ${config.pollInterval}ms`);
     console.log(`📊 Stats interval: ${config.statsInterval}ms`);
     console.log(`🌍 Source location: ${sourceCity} (${config.sourceLat}, ${config.sourceLng})`);
-    console.log(`🔒 Environment: ${config.nodeEnv}`);
+    console.log(`🔒 Environment: ${config.nodeEnv} | login user: ${dashboardUser}`);
     console.log(`\nWaiting for client connections...\n`);
   });
 }

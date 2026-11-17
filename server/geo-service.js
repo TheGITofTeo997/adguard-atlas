@@ -165,7 +165,7 @@ class GeoService {
         method: 'GET',
         signal: controller.signal,
         headers: {
-          'User-Agent': 'DNS-Visualization-Dashboard/2.0',
+          'User-Agent': 'AdGuard-Atlas/1.0',
           'Accept': 'application/json'
         }
       });
