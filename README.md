@@ -115,7 +115,7 @@ docker run -d --name adguard-atlas -p 8080:8080 \
   -e SOURCE_LAT=0 -e SOURCE_LNG=0 \
   --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
   --restart unless-stopped \
-  YOUR_DOCKERHUB_USER/adguard-atlas:latest
+  theaccountofteo997/adguard-atlas:latest
 ```
 
 > With `docker run`, `SESSION_SECRET` generated inline changes every time you recreate the container.
@@ -124,7 +124,7 @@ docker run -d --name adguard-atlas -p 8080:8080 \
 ### Build from source
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USER/adguard-atlas.git && cd adguard-atlas
+git clone https://github.com/thegitofteo997/adguard-atlas.git && cd adguard-atlas
 cp .env.example .env     # edit it
 docker compose up --build -d
 ```
