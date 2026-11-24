@@ -1,5 +1,5 @@
 export const PRESETS = {
-  midnight: { name: 'Midnight', bg: '#0b1020', panel: '#121a30', fg: '#e8ecf8', muted: '#8a94b2', line: '#25304f', accent: '#5b8cff' },
+  midnight: { name: 'Midnight', bg: '#0d151e', panel: '#14212c', fg: '#e7f0f4', muted: '#a6bbc7', line: '#304350', accent: '#6de8bf' },
   aurora:   { name: 'Aurora',   bg: '#07161a', panel: '#0d2228', fg: '#e6f6f3', muted: '#7fa7a3', line: '#1c3b42', accent: '#2de2c4' },
   ember:    { name: 'Ember',    bg: '#140c0a', panel: '#1f1412', fg: '#f8ece6', muted: '#b09189', line: '#3a2420', accent: '#ff7a3d' },
   mono:     { name: 'Mono',     bg: '#0a0a0a', panel: '#151515', fg: '#eaeaea', muted: '#8f8f8f', line: '#2a2a2a', accent: '#ffffff' },
@@ -51,3 +51,4 @@ export class ClientColors {
     return `hsl(${Math.round((i * 137.508) % 360)} 80% 62%)`;
   }
 }
+

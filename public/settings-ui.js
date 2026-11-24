@@ -71,11 +71,13 @@ export function initSettingsUI({ settings, defaults, presets, onChange, getServe
         ? `Enabled · ${s.recoveryLeft} recovery code${s.recoveryLeft === 1 ? '' : 's'} left.`
         : 'Disabled. Adds a one-time code from your authenticator app at sign-in.';
       show(s.twofa ? 'on' : 'off');
-      if (!s.persistent) msg('Warning: the data directory is not writable, 2FA will be lost on restart.');
+      if (!s.persistent) msg('2FA changes require a writable data directory. Check the Docker /data volume.');
     } catch (e) { msg(e.message); }
   }
 
-  $('twofa-start').addEventListener('click', async () => {
+  $('twofa-start').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     msg('');
     try {
       const r = await api('/api/2fa/setup', {});
@@ -83,18 +85,30 @@ export function initSettingsUI({ settings, defaults, presets, onChange, getServe
       $('twofa-secret').textContent = r.secret;
       $('twofa-code').value = '';
       show('setup');
+      $('twofa-code').focus();
     } catch (e) { msg(e.message); }
+    finally { button.disabled = false; }
   });
   $('twofa-cancel').addEventListener('click', loadSecurity);
-  $('twofa-confirm').addEventListener('click', async () => {
+  $('twofa-confirm').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     msg('');
     try {
       const r = await api('/api/2fa/enable', { code: $('twofa-code').value });
       $('twofa-recovery').textContent = r.recoveryCodes.join('\n');
+      $('twofa-status').textContent = 'Enabled. Use a fresh code at your next sign-in.';
+      $('twofa-code').value = '';
+      $('twofa-secret').textContent = '';
+      $('twofa-qr').removeAttribute('src');
       show('codes');
     } catch (e) { msg(e.message); }
+    finally { button.disabled = false; }
   });
-  $('twofa-done').addEventListener('click', () => { $('twofa-recovery').textContent = ''; loadSecurity().then(() => msg('2FA enabled.', true)); });
+  $('twofa-code').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') $('twofa-confirm').click();
+  });
+  $('twofa-done').addEventListener('click', () => { $('twofa-recovery').textContent = ''; loadSecurity(); });
   $('twofa-disable').addEventListener('click', async () => {
     msg('');
     try {
@@ -107,6 +121,7 @@ export function initSettingsUI({ settings, defaults, presets, onChange, getServe
 
   return {
     refresh,
-    open() { refresh(); loadSecurity(); dlg.showModal(); }
+    open() { refresh(); if ($('twofa-codes').hidden) loadSecurity(); dlg.showModal(); }
   };
 }
+

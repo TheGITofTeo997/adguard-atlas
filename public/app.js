@@ -28,6 +28,7 @@ function applyTheme() {
   r.style.setProperty('--blur', `${settings.blur}px`);
   r.dataset.theme = p.light ? 'light' : 'dark';
   r.dataset.side = settings.sidebar;
+  r.dataset.panel = settings.sidebarHidden ? 'hidden' : 'visible';
   $('panel').hidden = settings.sidebarHidden;
   $('show-panel').hidden = !settings.sidebarHidden;
 }
@@ -199,6 +200,7 @@ function onQuery(m) {
 }
 
 function addLog(d, color) {
+  $('log-empty')?.remove();
   const row = document.createElement('div');
   row.className = d.filtered ? 'log-row is-blocked' : 'log-row';
   const tag = document.createElement('span');

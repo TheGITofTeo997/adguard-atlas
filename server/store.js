@@ -3,7 +3,7 @@ import path from 'node:path';
 
 /**
  * Tiny JSON file store for server-side state (2FA). Pass dir=null for in-memory only.
- * If the directory is not writable the app keeps working but nothing persists.
+ * State changes are committed only after the new file has been written.
  */
 export function createStore(dir) {
   const state = { twofa: null, pending: null };
@@ -21,15 +21,23 @@ export function createStore(dir) {
   return {
     data: state,
     get persistent() { return file !== null; },
-    save() {
-      if (!file) return;
+    update(patch) {
+      const next = { ...state, ...patch };
+      if (!dir) {
+        Object.assign(state, next);
+        return;
+      }
+      if (!file) throw new Error('2FA data directory is unavailable');
       try {
         const tmp = `${file}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
+        fs.writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
         fs.renameSync(tmp, file);
+        Object.assign(state, next);
       } catch (err) {
         console.error('Failed to persist data:', err.message);
+        throw err;
       }
     }
   };
 }
+

@@ -89,7 +89,8 @@ class DNSPoller {
     this.geoService = geoService;
     this.config = config;
 
-    this.activeConnections = new Set();
+    this.activeConnections = new Map();
+    this.dnsPollInFlight = false;
     this.processedIds = new Set();
     this.lastPollTime = Date.now();
     this.dnsPollingInterval = null;
@@ -97,7 +98,7 @@ class DNSPoller {
   }
 
   addConnection(ws) {
-    this.activeConnections.add(ws);
+    this.activeConnections.set(ws, Date.now());
   }
 
   removeConnection(ws) {
@@ -107,6 +108,7 @@ class DNSPoller {
   startPolling() {
     if (this.dnsPollingInterval || this.activeConnections.size === 0) return;
 
+    this.lastPollTime = Date.now();
     console.log('▶️  Starting DNS polling...');
 
     this.dnsPollingInterval = setInterval(async () => {
@@ -147,27 +149,40 @@ class DNSPoller {
   }
 
   async pollDNSLogs() {
-    const logs = await this.adguardClient.getQueryLog();
-
+    if (this.dnsPollInFlight) return;
+    this.dnsPollInFlight = true;
     const currentPollTime = Date.now();
+    const cutoffTime = this.lastPollTime - 2000;
+    try {
+      await this.processQueryLog(currentPollTime, cutoffTime);
+    } finally {
+      this.dnsPollInFlight = false;
+    }
+  }
+
+  async processQueryLog(currentPollTime, cutoffTime) {
+    const logs = await this.adguardClient.getQueryLog();
+    if (!this.activeConnections.size) return;
     const timeSinceLastPoll = currentPollTime - this.lastPollTime;
 
     const blockedCount = logs.filter(entry => entry.filtered).length;
     const totalCount = logs.length;
 
-    const cutoffTime = new Date(this.lastPollTime - 2000);
-    const newEntries = logs.filter(entry => entry.timestamp > cutoffTime);
+    const oldestConnection = Math.min(...this.activeConnections.values());
+    const newEntries = logs
+      .filter(entry => entry.timestamp > cutoffTime && entry.timestamp >= oldestConnection)
+      .sort((a, b) => a.timestamp - b.timestamp);
 
     if (totalCount > 0) {
       console.log(`📊 Fetched ${totalCount} DNS entries (${blockedCount} blocked) - ${newEntries.length} new entries since last poll (${(timeSinceLastPoll / 1000).toFixed(1)}s ago)`);
     }
 
-    this.lastPollTime = currentPollTime;
+    this.lastPollTime = Math.max(this.lastPollTime, currentPollTime);
     let processedCount = 0;
     let skippedDuplicates = 0;
 
     for (const entry of newEntries) {
-      const entryId = `${entry.timestamp.getTime()}-${entry.domain}-${entry.client}`;
+      const entryId = `${entry.timestamp.getTime()}-${entry.domain}-${entry.client}-${entry.type}`;
 
       if (this.processedIds.has(entryId)) {
         skippedDuplicates++;
@@ -306,21 +321,22 @@ class DNSPoller {
   broadcast(message) {
     const data = JSON.stringify(message);
 
-    this.activeConnections.forEach(ws => {
-      if (ws.readyState === 1) {
+    const queryTime = message.type === 'dns_query' ? Date.parse(message.timestamp) : Infinity;
+    for (const [ws, connectedAt] of this.activeConnections) {
+      if (ws.readyState === 1 && queryTime >= connectedAt) {
         try {
           ws.send(data);
         } catch (error) {
           console.error('Error broadcasting to client:', error.message);
         }
       }
-    });
+    }
   }
 
   shutdown() {
-    this.activeConnections.forEach(ws => {
+    for (const ws of this.activeConnections.keys()) {
       ws.close(1000, 'Server shutting down');
-    });
+    }
     this.activeConnections.clear();
     this.stopPolling();
   }
@@ -371,7 +387,9 @@ app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next
 
 security.publicRoutes(app);
 
-// Login page is the only public content; everything below requires a session
+app.get('/atlas-mark.svg', (req, res) => res.sendFile(path.join(__dirname, '../public/atlas-mark.svg')));
+
+// Login page is public; everything below it requires a session
 app.use('/login', express.static(path.join(__dirname, '../login')));
 app.use(auth.require);
 security.protectedRoutes(app);

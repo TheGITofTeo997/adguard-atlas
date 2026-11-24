@@ -21,29 +21,37 @@ export function createSecurityRoutes({ auth, store, user }) {
   const sameOrigin = (req, res, next) => {
     const origin = req.headers.origin;
     if (origin) {
-      try { if (new URL(origin).host !== req.headers.host) throw new Error('cross-origin'); }
+      try { if (![req.headers.host, req.host].includes(new URL(origin).host)) throw new Error('cross-origin'); }
       catch { return res.status(403).json({ error: 'forbidden' }); }
     }
     next();
   };
 
+  function saveSecurity(res, patch) {
+    try {
+      store.update(patch);
+      return true;
+    } catch {
+      res.status(503).json({ error: 'Could not save 2FA settings. Check that the Docker /data volume is writable.' });
+      return false;
+    }
+  }
+
   /** TOTP code (replay-protected) or one-time recovery code. */
   function checkSecondFactor(code) {
     const t = store.data.twofa;
-    if (!t?.enabled) return false;
-    const c = String(code ?? '').trim();
+    if (!t?.enabled) return { error: 'Two-factor authentication is unavailable' };
+    const c = String(code ?? '').replace(/\s/g, '');
     if (/^\d{6}$/.test(c)) {
-      const counter = verifyTotp(t.secret, c, t.lastCounter ?? -1);
-      if (counter === null) return false;
-      t.lastCounter = counter;
-      store.save();
-      return true;
+      const counter = verifyTotp(t.secret, c);
+      if (counter === null) return { error: 'Invalid code. Check the time on your authenticator device.' };
+      if (counter <= (t.lastCounter ?? -1)) return { error: 'This code was already used. Wait for the next code.' };
+      return { state: { ...t, lastCounter: counter } };
     }
-    const i = t.recovery.indexOf(sha(normRecovery(c)));
-    if (i === -1) return false;
-    t.recovery.splice(i, 1);
-    store.save();
-    return true;
+    const recovery = t.recovery ?? [];
+    const i = recovery.indexOf(sha(normRecovery(c)));
+    if (i === -1) return { error: 'Invalid recovery code' };
+    return { state: { ...t, recovery: recovery.filter((_, index) => index !== i) } };
   }
 
   return {
@@ -66,12 +74,14 @@ export function createSecurityRoutes({ auth, store, user }) {
         if (!ticket || ticket.k !== '2fa') return res.status(401).json({ error: 'Session expired, sign in again' });
         const failed = attempts.get(ticket.id) ?? 0;
         if (failed >= MAX_TICKET_ATTEMPTS) return res.status(429).json({ error: 'Too many attempts, sign in again' });
-        if (!checkSecondFactor(req.body?.code)) {
+        const factor = checkSecondFactor(req.body?.code);
+        if (factor.error) {
           if (attempts.size > 1000) attempts.clear();
           attempts.set(ticket.id, failed + 1);
-          return res.status(401).json({ error: 'Invalid code' });
+          return res.status(401).json({ error: factor.error });
         }
-        attempts.delete(ticket.id);
+        if (!saveSecurity(res, { twofa: factor.state })) return;
+        attempts.set(ticket.id, MAX_TICKET_ATTEMPTS);
         auth.issue(res);
         res.json({ ok: true });
       });
@@ -91,24 +101,23 @@ export function createSecurityRoutes({ auth, store, user }) {
       app.post('/api/2fa/setup', sameOrigin, limiter, json, async (req, res) => {
         if (store.data.twofa?.enabled) return res.status(409).json({ error: '2FA already enabled' });
         const secret = generateSecret();
-        store.data.pending = { secret, created: Date.now() };
-        store.save();
         const uri = otpauthUri({ secret, account: user });
-        res.json({ secret, otpauth: uri, qr: await QRCode.toDataURL(uri, { margin: 1, width: 220 }) });
+        const qr = await QRCode.toDataURL(uri, { margin: 4, width: 240 });
+        if (!saveSecurity(res, { pending: { secret, created: Date.now() } })) return;
+        res.json({ secret, otpauth: uri, qr });
       });
 
       app.post('/api/2fa/enable', sameOrigin, limiter, json, (req, res) => {
         const p = store.data.pending;
         if (!p || Date.now() - p.created > 15 * 60 * 1000) return res.status(400).json({ error: 'Setup expired, start again' });
-        const counter = verifyTotp(p.secret, String(req.body?.code ?? '').trim());
+        const counter = verifyTotp(p.secret, String(req.body?.code ?? '').replace(/\s/g, ''));
         if (counter === null) return res.status(401).json({ error: 'Invalid code' });
         const codes = Array.from({ length: 8 }, () => {
           const h = crypto.randomBytes(5).toString('hex');
           return `${h.slice(0, 5)}-${h.slice(5)}`;
         });
-        store.data.twofa = { enabled: true, secret: p.secret, lastCounter: counter, recovery: codes.map((c) => sha(normRecovery(c))) };
-        store.data.pending = null;
-        store.save();
+        const twofa = { enabled: true, secret: p.secret, lastCounter: counter, recovery: codes.map((c) => sha(normRecovery(c))) };
+        if (!saveSecurity(res, { twofa, pending: null })) return;
         res.json({ recoveryCodes: codes });
       });
 
@@ -116,12 +125,13 @@ export function createSecurityRoutes({ auth, store, user }) {
         const { password, code } = req.body ?? {};
         if (!store.data.twofa?.enabled) return res.status(409).json({ error: '2FA is not enabled' });
         const okPassword = typeof password === 'string' && auth.check(user, password);
-        const okCode = checkSecondFactor(code);
-        if (!okPassword || !okCode) return res.status(401).json({ error: 'Invalid password or code' });
-        store.data.twofa = null;
-        store.save();
+        if (!okPassword) return res.status(401).json({ error: 'Invalid password or code' });
+        const factor = checkSecondFactor(code);
+        if (factor.error) return res.status(401).json({ error: factor.error });
+        if (!saveSecurity(res, { twofa: null, pending: null })) return;
         res.json({ ok: true });
       });
     }
   };
 }
+

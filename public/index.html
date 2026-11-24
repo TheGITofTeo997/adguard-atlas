@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AdGuard Atlas</title>
+  <link rel="icon" type="image/svg+xml" href="/atlas-mark.svg">
   <link rel="stylesheet" href="/vendor/maplibre-gl/maplibre-gl.css">
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -19,7 +20,7 @@
 
   <aside id="panel" class="glass">
     <header>
-      <div class="brand"><span class="logo" aria-hidden="true"></span><h1>AdGuard Atlas</h1></div>
+      <div class="brand"><img class="logo" src="/atlas-mark.svg" alt="" width="36" height="36"><h1>AdGuard Atlas</h1></div>
       <div class="head-actions">
         <span id="conn" class="pill" data-state="connecting">Connecting</span>
         <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
@@ -53,7 +54,7 @@
 
     <section class="grow">
       <h2>Live queries</h2>
-      <div id="log"></div>
+      <div id="log"><p class="muted" id="log-empty">Waiting for new DNS queries…</p></div>
     </section>
 
     <footer><button id="btn-logout" type="button" class="link">Sign out</button></footer>
@@ -111,9 +112,9 @@
         <div id="twofa-off" hidden><button type="button" id="twofa-start">Enable 2FA</button></div>
         <div id="twofa-setup" hidden>
           <p class="muted">Scan with an authenticator app (Google Authenticator, Aegis, 1Password…), then enter the 6-digit code.</p>
-          <img id="twofa-qr" alt="2FA QR code" width="180" height="180">
+          <img id="twofa-qr" alt="2FA QR code" width="240" height="240">
           <p class="muted">Manual key: <code id="twofa-secret"></code></p>
-          <div class="inline"><input id="twofa-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="123456"><button type="button" id="twofa-confirm">Confirm</button><button type="button" id="twofa-cancel" class="link">cancel</button></div>
+          <div class="inline"><input id="twofa-code" inputmode="numeric" maxlength="8" autocomplete="one-time-code" aria-label="Authentication code" placeholder="123456"><button type="button" id="twofa-confirm">Confirm</button><button type="button" id="twofa-cancel" class="link">cancel</button></div>
         </div>
         <div id="twofa-codes" hidden>
           <p><strong>Save these recovery codes now.</strong> Each can be used once if you lose your device. They will not be shown again.</p>
