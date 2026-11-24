@@ -11,6 +11,7 @@ import GeoService from './geo-service.js';
 import { createAuth } from './auth.js';
 import { createStore } from './store.js';
 import { createSecurityRoutes } from './security.js';
+import { HomepageMetrics, createHomepageHandler } from './homepage.js';
 
 try { process.loadEnvFile(); } catch { /* no .env file: rely on real environment */ }
 
@@ -83,11 +84,16 @@ const auth = createAuth({
 const store = createStore(process.env.NODE_ENV === 'test' ? null : (process.env.DATA_DIR || path.join(__dirname, '../data')));
 const security = createSecurityRoutes({ auth, store, user: dashboardUser });
 
+const homepageToken = process.env.HOMEPAGE_API_TOKEN?.trim();
+const homepageMetrics = homepageToken ? new HomepageMetrics() : null;
+
 class DNSPoller {
-  constructor(adguardClient, geoService, config) {
+  constructor(adguardClient, geoService, config, homepage = null) {
     this.adguardClient = adguardClient;
     this.geoService = geoService;
     this.config = config;
+    this.homepage = homepage;
+    this.streamStartedAt = null;
 
     this.activeConnections = new Map();
     this.dnsPollInFlight = false;
@@ -106,9 +112,15 @@ class DNSPoller {
   }
 
   startPolling() {
-    if (this.dnsPollingInterval || this.activeConnections.size === 0) return;
+    if (this.activeConnections.size && !this.statsPollingInterval) {
+      this.statsPollingInterval = setInterval(() => {
+        this.pollStats().catch(err => console.error('Error in stats polling:', err.message));
+      }, this.config.statsInterval);
+      this.pollStats().catch(err => console.error('Initial stats poll failed:', err.message));
+    }
+    if (this.dnsPollingInterval || (!this.homepage && !this.activeConnections.size)) return;
 
-    this.lastPollTime = Date.now();
+    this.streamStartedAt = this.lastPollTime = Date.now();
     console.log('▶️  Starting DNS polling...');
 
     this.dnsPollingInterval = setInterval(async () => {
@@ -120,32 +132,19 @@ class DNSPoller {
       }
     }, this.config.pollInterval);
 
-    this.statsPollingInterval = setInterval(async () => {
-      try {
-        await this.pollStats();
-      } catch (error) {
-        console.error('Error in stats polling:', error.message);
-      }
-    }, this.config.statsInterval);
-
-    this.pollDNSLogs().catch(err => console.error('Initial DNS poll failed:', err));
-    this.pollStats().catch(err => console.error('Initial stats poll failed:', err));
+    this.pollDNSLogs().catch(err => console.error('Initial DNS poll failed:', err.message));
   }
 
   stopPolling() {
-    if (this.activeConnections.size > 0) return;
+    if (this.activeConnections.size) return;
+    clearInterval(this.statsPollingInterval);
+    this.statsPollingInterval = null;
+    if (!this.homepage) this.stopDNSPolling();
+  }
 
-    console.log('⏸️  Stopping DNS polling (no active connections)...');
-
-    if (this.dnsPollingInterval) {
-      clearInterval(this.dnsPollingInterval);
-      this.dnsPollingInterval = null;
-    }
-
-    if (this.statsPollingInterval) {
-      clearInterval(this.statsPollingInterval);
-      this.statsPollingInterval = null;
-    }
+  stopDNSPolling() {
+    clearInterval(this.dnsPollingInterval);
+    this.dnsPollingInterval = null;
   }
 
   async pollDNSLogs() {
@@ -162,15 +161,17 @@ class DNSPoller {
 
   async processQueryLog(currentPollTime, cutoffTime) {
     const logs = await this.adguardClient.getQueryLog();
-    if (!this.activeConnections.size) return;
+    if (!this.homepage && !this.activeConnections.size) return;
     const timeSinceLastPoll = currentPollTime - this.lastPollTime;
 
     const blockedCount = logs.filter(entry => entry.filtered).length;
     const totalCount = logs.length;
 
-    const oldestConnection = Math.min(...this.activeConnections.values());
+    const streamStart = this.homepage
+      ? this.streamStartedAt ?? this.lastPollTime
+      : Math.min(...this.activeConnections.values());
     const newEntries = logs
-      .filter(entry => entry.timestamp > cutoffTime && entry.timestamp >= oldestConnection)
+      .filter(entry => entry.timestamp > cutoffTime && entry.timestamp >= streamStart)
       .sort((a, b) => a.timestamp - b.timestamp);
 
     if (totalCount > 0) {
@@ -278,6 +279,8 @@ class DNSPoller {
       entry.answer.map(ip => this.geoService.lookup(ip).then(destination => ({ ip, destination })))
     );
 
+    if (!entry.filtered) this.homepage?.record(entry.timestamp, lookups);
+
     for (const { ip, destination } of lookups) {
       console.log(`  🌍 Looking up GeoIP for: ${ip}`);
 
@@ -339,12 +342,13 @@ class DNSPoller {
     }
     this.activeConnections.clear();
     this.stopPolling();
+    this.stopDNSPolling();
   }
 }
 
 const app = express();
 const server = http.createServer(app);
-const poller = new DNSPoller(adguardClient, geoService, config);
+const poller = new DNSPoller(adguardClient, geoService, config, homepageMetrics);
 
 if (process.env.TRUST_PROXY) {
   const tp = process.env.TRUST_PROXY;
@@ -386,6 +390,7 @@ app.use(limiter);
 app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 security.publicRoutes(app);
+app.get('/api/homepage', createHomepageHandler(homepageToken, homepageMetrics));
 
 app.get('/atlas-mark.svg', (req, res) => res.sendFile(path.join(__dirname, '../public/atlas-mark.svg')));
 
@@ -484,6 +489,7 @@ export { DNSPoller };
 
 if (process.env.NODE_ENV !== 'test') {
   server.listen(config.port, () => {
+    poller.startPolling();
     const sourceCity = process.env.SOURCE_CITY || 'configured location';
     console.log(`\n🚀 AdGuard Atlas`);
     console.log(`📡 Server running on http://localhost:${config.port}`);

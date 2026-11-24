@@ -1,0 +1,20 @@
+- Rete:
+    - AdGuard Atlas:
+        icon: mdi-earth
+        href: http://IP_DEL_NAS:8080/
+        widget:
+          type: customapi
+          url: http://IP_DEL_NAS:8080/api/homepage
+          refreshInterval: 30000
+          headers:
+            X-Atlas-Token: "{{HOMEPAGE_VAR_ATLAS_TOKEN}}"
+          mappings:
+            - field: topCountry
+              label: Paese in testa
+              format: text
+            - field: countriesReached
+              label: Paesi · 15 min
+              format: number
+            # - field: topCountryHits
+            #   label: Query verso il primo Paese
+            #   format: number
