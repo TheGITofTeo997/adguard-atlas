@@ -17,7 +17,8 @@ ENV NODE_ENV=production \
 
 # Pick up base-image security fixes, add a proper init, drop npm/npx (not needed at runtime)
 RUN apk upgrade --no-cache \
-    && apk add --no-cache dumb-init \
+    && apk add --no-cache --upgrade dumb-init \
+        'libcrypto3>=3.5.9-r1' 'libssl3>=3.5.9-r1' \
     && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
     && mkdir -p /data && chown node:node /data
 

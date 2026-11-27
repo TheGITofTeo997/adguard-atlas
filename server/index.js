@@ -20,10 +20,11 @@ const __dirname = path.dirname(__filename);
 
 const parseEnvInt = (val) => val ? parseInt(val, 10) : undefined;
 
-const envFloat = (v, d) => {
-  const n = Number.parseFloat(v);
-  return Number.isFinite(n) ? n : d;
-};
+const MILAN = { lat: 45.4642, lng: 9.1900, city: 'Milan', country: 'Italy' };
+const sourceLat = Number.parseFloat(process.env.SOURCE_LAT);
+const sourceLng = Number.parseFloat(process.env.SOURCE_LNG);
+const hasSourceCoordinates = Math.abs(sourceLat) <= 90 && Math.abs(sourceLng) <= 180;
+const source = hasSourceCoordinates ? { lat: sourceLat, lng: sourceLng } : MILAN;
 
 const config = {
   port: parseEnvInt(process.env.PORT) || 8080,
@@ -32,13 +33,11 @@ const config = {
   maxProcessedIds: parseEnvInt(process.env.MAX_PROCESSED_IDS) || 1000,
   maxConcurrentArcs: parseEnvInt(process.env.MAX_CONCURRENT_ARCS) || 50,
   maxConnections: parseEnvInt(process.env.MAX_WS_CONNECTIONS) || 50,
-  sourceLat: envFloat(process.env.SOURCE_LAT, 0),
-  sourceLng: envFloat(process.env.SOURCE_LNG, 0),
   nodeEnv: process.env.NODE_ENV || 'development'
 };
 
-if (!Number.isFinite(Number.parseFloat(process.env.SOURCE_LAT)) || !Number.isFinite(Number.parseFloat(process.env.SOURCE_LNG))) {
-  console.warn('⚠️  SOURCE_LAT / SOURCE_LNG not set (or invalid): using 0,0. Set them in .env or override the location in the UI settings.');
+if (!hasSourceCoordinates && (process.env.SOURCE_LAT || process.env.SOURCE_LNG)) {
+  console.warn('⚠️  SOURCE_LAT / SOURCE_LNG incomplete or invalid: using Milan, Italy. Set them in .env or override the location in the UI settings.');
 }
 
 const requiredEnvVars = ['ADGUARD_URL', 'ADGUARD_USERNAME', 'ADGUARD_PASSWORD'];
@@ -56,7 +55,7 @@ const adguardClient = new AdGuardClient(
   process.env.ADGUARD_PASSWORD
 );
 
-const geoService = new GeoService(config.sourceLat, config.sourceLng, {
+const geoService = new GeoService(source.lat, source.lng, {
   apiUrl: process.env.GEOIP_API_URL,
   apiTimeout: parseEnvInt(process.env.GEOIP_API_TIMEOUT),
   maxRetries: parseEnvInt(process.env.GEOIP_MAX_RETRIES),
@@ -64,8 +63,8 @@ const geoService = new GeoService(config.sourceLat, config.sourceLng, {
   maxCacheSize: parseEnvInt(process.env.GEOIP_MAX_CACHE_SIZE),
   maxRequestsPerMinute: parseEnvInt(process.env.GEOIP_MAX_REQUESTS_PER_MINUTE),
   minRequestDelay: parseEnvInt(process.env.GEOIP_MIN_REQUEST_DELAY),
-  sourceCity: process.env.SOURCE_CITY,
-  sourceCountry: process.env.SOURCE_COUNTRY
+  sourceCity: process.env.SOURCE_CITY || source.city,
+  sourceCountry: process.env.SOURCE_COUNTRY || source.country
 });
 
 let dashboardPassword = process.env.DASHBOARD_PASSWORD;
@@ -75,13 +74,13 @@ if (!dashboardPassword) {
 }
 const dashboardUser = process.env.DASHBOARD_USER || 'admin';
 const secureCookie = process.env.COOKIE_SECURE === 'true';
+const store = createStore(process.env.NODE_ENV === 'test' ? null : (process.env.DATA_DIR || path.join(__dirname, '../data')));
 const auth = createAuth({
   user: dashboardUser,
   password: dashboardPassword,
-  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
+  secret: process.env.SESSION_SECRET || store.sessionSecret(),
   secure: secureCookie
 });
-const store = createStore(process.env.NODE_ENV === 'test' ? null : (process.env.DATA_DIR || path.join(__dirname, '../data')));
 const security = createSecurityRoutes({ auth, store, user: dashboardUser });
 
 const homepageToken = process.env.HOMEPAGE_API_TOKEN?.trim();
@@ -490,12 +489,12 @@ export { DNSPoller };
 if (process.env.NODE_ENV !== 'test') {
   server.listen(config.port, () => {
     poller.startPolling();
-    const sourceCity = process.env.SOURCE_CITY || 'configured location';
+    const { city: sourceCity, lat, lng } = geoService.getSource();
     console.log(`\n🚀 AdGuard Atlas`);
     console.log(`📡 Server running on http://localhost:${config.port}`);
     console.log(`🔄 Polling interval: ${config.pollInterval}ms`);
     console.log(`📊 Stats interval: ${config.statsInterval}ms`);
-    console.log(`🌍 Source location: ${sourceCity} (${config.sourceLat}, ${config.sourceLng})`);
+    console.log(`🌍 Source location: ${sourceCity} (${lat}, ${lng})`);
     console.log(`🔒 Environment: ${config.nodeEnv} | login user: ${dashboardUser}`);
     console.log(`\nWaiting for client connections...\n`);
   });

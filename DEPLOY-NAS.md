@@ -12,6 +12,38 @@ Occorrono Docker con Compose, accesso a Internet per la build e un'istanza di Ad
 
 ## Aggiornamento di un'installazione esistente
 
-Estrai i file nella cartella della stessa installazione e conserva il tuo `.env`. Se usi un nome di progetto Compose personalizzato, mantienilo anche durante il deploy. Esegui di nuovo `docker compose up -d --build`. Il volume Compose `atlas-data` contiene la configurazione 2FA. Evita `docker compose down -v`, che rimuove il volume.
+Estrai i file nella cartella della stessa installazione e conserva il tuo `.env`. Se usi un nome di progetto Compose personalizzato, mantienilo anche durante il deploy. Per applicare anche gli aggiornamenti Alpine, esegui i comandi riportati sotto. Il volume Compose `atlas-data` contiene la configurazione 2FA. Evita `docker compose down -v`, che rimuove il volume.
 
 Il Dockerfile costruisce l'immagine sul NAS per la sua architettura. La prima build scarica l'immagine base e le dipendenze.
+
+## Widget Homepage
+
+Segui [HOMEPAGE.md](HOMEPAGE.md) e usa il servizio di homepage-services.example.yaml.
+
+
+## Aggiornamento OpenSSL e sessioni
+
+Nella stessa cartella Compose, esegui:
+
+```sh
+docker compose build --pull --no-cache
+docker compose up -d
+docker compose exec adguard-atlas apk info -v libcrypto3 libssl3
+```
+
+Le due librerie devono risultare alla versione 3.5.9-r1 o successiva. Il Dockerfile richiede questa versione minima per le cinque CVE Alpine riportate nella scansione del 27 novembre 2026. Ripeti la scansione sull'immagine appena ricostruita.
+
+Al login l'opzione Remember me estende la sessione a 30 giorni anche con 2FA. Se SESSION_SECRET è già configurato, conserva il suo valore. In assenza di questa variabile Atlas salva la nuova chiave nel volume atlas-data e potrebbe chiedere di accedere una volta dopo l'aggiornamento.
+
+## Posizione predefinita Milano
+
+Per usare Milano anche su un'installazione esistente, aggiorna solo queste righe nel tuo .env:
+
+```dotenv
+SOURCE_LAT=45.4642
+SOURCE_LNG=9.1900
+SOURCE_CITY=Milan
+SOURCE_COUNTRY=Italy
+```
+
+Se è attivo un override dal pannello Settings → Map, usa il pulsante server per tornare alla posizione configurata nel container.

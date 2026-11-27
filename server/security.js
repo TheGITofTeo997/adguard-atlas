@@ -57,15 +57,15 @@ export function createSecurityRoutes({ auth, store, user }) {
   return {
     publicRoutes(app) {
       app.post('/api/login', sameOrigin, limiter, json, (req, res) => {
-        const { username, password } = req.body ?? {};
+        const { username, password, remember } = req.body ?? {};
         if (typeof username !== 'string' || typeof password !== 'string' || !auth.check(username, password)) {
           return res.status(401).json({ error: 'Invalid credentials' });
         }
         if (store.data.twofa?.enabled) {
           const id = crypto.randomBytes(8).toString('hex');
-          return res.json({ twofa: true, ticket: auth.seal({ k: '2fa', id }, TICKET_TTL) });
+          return res.json({ twofa: true, ticket: auth.seal({ k: '2fa', id, remember: remember === true }, TICKET_TTL) });
         }
-        auth.issue(res);
+        auth.issue(res, remember);
         res.json({ ok: true });
       });
 
@@ -82,7 +82,7 @@ export function createSecurityRoutes({ auth, store, user }) {
         }
         if (!saveSecurity(res, { twofa: factor.state })) return;
         attempts.set(ticket.id, MAX_TICKET_ATTEMPTS);
-        auth.issue(res);
+        auth.issue(res, ticket.remember);
         res.json({ ok: true });
       });
 

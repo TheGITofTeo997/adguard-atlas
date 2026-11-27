@@ -6,7 +6,7 @@ services:
     env_file: .env
     volumes:
       - atlas-data:/data                       # persists 2FA configuration
-    networks:
+    networks:                                  # this my reverse proxy network, you can expose port instead of this
       proxy-network:
         ipv4_address: 172.30.0.115
     read_only: true
@@ -16,7 +16,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    image: theaccountofteo997/adguard-atlas
+    image: theaccountofteo997/adguard-atlas:latest
 
 volumes:
   atlas-data:

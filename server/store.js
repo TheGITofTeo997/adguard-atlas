@@ -1,8 +1,9 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * Tiny JSON file store for server-side state (2FA). Pass dir=null for in-memory only.
+ * JSON file store for 2FA and the session signing key. Pass dir=null for in-memory only.
  * State changes are committed only after the new file has been written.
  */
 export function createStore(dir) {
@@ -20,6 +21,18 @@ export function createStore(dir) {
   }
   return {
     data: state,
+    sessionSecret() {
+      if (typeof state.sessionSecret === 'string' && /^[0-9a-f]{64}$/.test(state.sessionSecret)) {
+        return state.sessionSecret;
+      }
+      const sessionSecret = crypto.randomBytes(32).toString('hex');
+      try {
+        this.update({ sessionSecret });
+      } catch {
+        console.warn('Could not save the session signing key. Set SESSION_SECRET or make DATA_DIR writable to keep sessions across restarts.');
+      }
+      return sessionSecret;
+    },
     get persistent() { return file !== null; },
     update(patch) {
       const next = { ...state, ...patch };

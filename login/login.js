@@ -41,7 +41,7 @@ form.addEventListener('submit', async (event) => {
   try {
     const { res, data } = ticket
       ? await post('/api/login/2fa', { ticket, code: form.elements.code.value })
-      : await post('/api/login', { username: form.elements.username.value, password: form.elements.password.value });
+      : await post('/api/login', { username: form.elements.username.value, password: form.elements.password.value, remember: form.elements.remember.checked });
 
     if (res.ok && data.twofa) { ticket = data.ticket; step(true); return; }
     if (res.ok) { window.location.href = '/'; return; }

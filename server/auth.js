@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 
 const COOKIE = 'atlas_session';
 const TTL_MS = 12 * 60 * 60 * 1000;
+const REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
 
 /**
@@ -57,13 +58,14 @@ export function createAuth({ user, password, secret, secure = false }) {
       const okUser = crypto.timingSafeEqual(sha(u), userHash);
       return okPass && okUser;
     },
-    issue(res) {
-      res.cookie(COOKIE, seal({ k: 'session' }, TTL_MS), {
-        httpOnly: true, sameSite: 'strict', secure, maxAge: TTL_MS, path: '/'
+    issue(res, remember = false) {
+      const ttl = remember === true ? REMEMBER_TTL_MS : TTL_MS;
+      res.cookie(COOKIE, seal({ k: 'session' }, ttl), {
+        httpOnly: true, sameSite: 'strict', secure, maxAge: ttl, path: '/'
       });
     },
     clear(res) {
-      res.clearCookie(COOKIE, { path: '/' });
+      res.clearCookie(COOKIE, { httpOnly: true, sameSite: 'strict', secure, path: '/' });
     },
     require(req, res, next) {
       if (fromReq(req)) return next();
